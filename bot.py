@@ -20,9 +20,16 @@
       ומשווה לתמונות השמורות, ומחזיר את ההתאמה הכי קרובה אם יש כזו.
   התוצאה חוזרת מעוצבת (⭐️ מותג, ✅ פרטים, 🔥 מחיר, 🔗 קישור מוסתר) + פוטר קבוע.
 
-- /list -> אדמין בלבד: מציג את כל המוצרים בקטלוג.
+- /list -> אדמין בלבד: מציג את כל המוצרים בקטלוג (מזהה, מותג, מחיר, קישור).
+- /edit <id> -> אדמין בלבד: מתחיל עריכת מוצר קיים - שולחים תמונה+כיתוב חדשים
+  (כמו בהוספה) והם מחליפים את הישן. שדה שמשאירים ריק/לא כתוב נשאר כמו שהיה.
+- /canceledit -> מבטל עריכה שהתחילה עם /edit.
 - /delete <id> -> אדמין בלבד: מוחק מוצר מהקטלוג.
 - /groupid -> מציג את מזהה הקבוצה הנוכחית (שימושי כדי להגדיר CATALOG_GROUP_ID).
+
+הערה לגבי אמינות: כל שגיאה בלתי צפויה נתפסת ע"י error handler גלובלי -
+המשתמש תמיד יקבל הודעה שמשהו השתבש (במקום שקט מוחלט), והשגיאה המלאה
+נכתבת ללוגים של השרת.
 """
 
 import html
@@ -85,6 +92,10 @@ RESULT_FOOTER_HTML = (
 )
 
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# מצב עריכה זמני (בזיכרון, לא נשמר בין הפעלות מחדש): user_id -> product_id
+# שממתין לתמונה+כיתוב הבאים שאותו משתמש ישלח, כדי להחליף את המוצר.
+PENDING_EDITS: dict[int, str] = {}
 
 
 def load_catalog() -> list[dict]:
@@ -210,6 +221,39 @@ async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def handle_edit_product(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: str
+) -> None:
+    """מחליף שדות/תמונה של מוצר קיים. שדה ריק בכיתוב החדש משאיר את הערך הישן."""
+    catalog = load_catalog()
+    idx = next((i for i, p in enumerate(catalog) if p["id"] == product_id), None)
+    if idx is None:
+        await update.message.reply_text(
+            f"המוצר {product_id} כבר לא קיים בקטלוג - העריכה בוטלה."
+        )
+        return
+
+    item = catalog[idx]
+    fields = parse_caption(update.message.caption or "")
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    image_path = IMAGES_DIR / f"{product_id}.jpg"
+    await file.download_to_drive(str(image_path))
+
+    item["brand"] = fields["brand"] or item.get("brand", "")
+    item["details"] = fields["details"] or item.get("details", [])
+    item["price"] = fields["price"] or item.get("price", "")
+    item["link"] = fields["link"] or item.get("link", "")
+    item["phash"] = str(imagehash.phash(Image.open(image_path)))
+    item["image_path"] = str(image_path.relative_to(BASE_DIR))
+
+    catalog[idx] = item
+    save_catalog(catalog)
+
+    await update.message.reply_text(f"✏️ מוצר {product_id} עודכן!\nמותג: {item['brand'] or '—'}")
+
+
 async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """טיפול בהודעת טקסט - מזהה 'חפש לי <משהו>' ומחפש בקטלוג."""
     text = update.message.text or ""
@@ -235,11 +279,17 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """מנתב תמונה נכנסת: הוספה לקטלוג (מקבוצת ההעלאה, או מאדמין בפרטי) או חיפוש."""
+    """מנתב תמונה נכנסת: עריכה ממתינה / הוספה לקטלוג / חיפוש."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     caption = update.message.caption or ""
     has_valid_caption = bool(parse_caption(caption).get("link"))
+
+    # 0. יש עריכה ממתינה למשתמש הזה (מ-/edit) -> תמיד עדיפות ראשונה
+    pending_product_id = PENDING_EDITS.pop(user.id, None)
+    if pending_product_id is not None:
+        await handle_edit_product(update, context, pending_product_id)
+        return
 
     # 1. הודעה בקבוצת ההעלאה המיועדת -> תמיד ניסיון הוספה (לא תלוי מי שלח)
     if is_catalog_group(chat_id):
@@ -297,11 +347,47 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not catalog:
         await update.message.reply_text("הקטלוג ריק.")
         return
-    lines = [f"{item['id']} | {item.get('brand', '—')}" for item in catalog]
+
+    blocks = []
+    for item in catalog:
+        price_part = f" | {item['price']}" if item.get("price") else ""
+        blocks.append(
+            f"{item['id']} | {item.get('brand', '—')}{price_part}\n{item.get('link', '—')}"
+        )
+    text = "\n\n".join(blocks) + "\n\nלעריכה: /edit <מזהה>\nלמחיקה: /delete <מזהה>"
+
     # טלגרם מגביל אורך הודעה - נחלק לצ'אנקים אם צריך
-    text = "\n".join(lines)
     for i in range(0, len(text), 3500):
         await update.message.reply_text(text[i : i + 3500])
+
+
+async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("שימוש: /edit <מזהה מוצר>\nלרשימת מזהים: /list")
+        return
+
+    product_id = context.args[0]
+    catalog = load_catalog()
+    item = next((p for p in catalog if p["id"] == product_id), None)
+    if not item:
+        await update.message.reply_text(f"לא נמצא מוצר עם מזהה {product_id}")
+        return
+
+    PENDING_EDITS[update.effective_user.id] = product_id
+    await update.message.reply_text(
+        f"עורך את מוצר {product_id} ({item.get('brand') or '—'}).\n\n"
+        "עכשיו שלח תמונה חדשה עם כיתוב באותו פורמט (מותג/פרטים/מחיר/קישור). "
+        "שדה שתשאיר ריק יישאר כמו שהיה. לביטול: /canceledit"
+    )
+
+
+async def handle_cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if PENDING_EDITS.pop(update.effective_user.id, None) is not None:
+        await update.message.reply_text("העריכה בוטלה.")
+    else:
+        await update.message.reply_text("אין עריכה פעילה לביטול.")
 
 
 async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -339,6 +425,18 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """נתפס בכל שגיאה שלא טופלה - כותב ללוג ומודיע למשתמש במקום שקט מוחלט."""
+    logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "😕 קרתה תקלה בעיבוד ההודעה. נסה שוב - ואם זה חוזר, תבדוק את הלוגים בשרת."
+            )
+        except Exception:
+            pass
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("חסר BOT_TOKEN - הגדר משתנה סביבה BOT_TOKEN עם הטוקן מ-BotFather")
@@ -347,10 +445,13 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("list", handle_list))
+    app.add_handler(CommandHandler("edit", handle_edit))
+    app.add_handler(CommandHandler("canceledit", handle_cancel_edit))
     app.add_handler(CommandHandler("delete", handle_delete))
     app.add_handler(CommandHandler("groupid", handle_groupid))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_search))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_search))
+    app.add_error_handler(handle_error)
 
     logger.info("Bot starting...")
     app.run_polling()

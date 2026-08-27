@@ -1,5 +1,5 @@
 """
-בוט טלגרם לקטלוג מוצרים - חיפוש לפי שם מותג או לפי תמונה.
+בוט טלגרם לקטלוג מוצרים - חיפוש לפי שם מותג, לפי תמונה, או דפדוף בקטלוג.
 
 איך זה עובד:
 - הוספת מוצרים אפשרית בשתי דרכים (אפשר להשתמש בשתיהן ביחד):
@@ -15,10 +15,11 @@
     קישור: https://...
 
 - כל משתמש אחר (בצ'אט פרטי או בקבוצה אחרת, לא קבוצת ההעלאה) יכול:
-    - לכתוב "חפש לי <מותג>" -> הבוט מחפש התאמה טקסטואלית בקטלוג.
+    - לכתוב "חפש לי <מותג>" -> אם יש תוצאה אחת, מקבל תמונה+פרטים מלאים.
+      אם יש כמה תוצאות, מקבל רשת תמונות ממוספרת עם כפתורים לבחירה.
+    - לכתוב "קטלוג" (או /catalog) -> רשת דפדוף על כל המוצרים בקטלוג.
     - לשלוח תמונה -> הבוט מחשב טביעת אצבע ויזואלית (perceptual hash)
-      ומשווה לתמונות השמורות, ומחזיר את ההתאמה הכי קרובה אם יש כזו.
-  התוצאה חוזרת מעוצבת (⭐️ מותג, ✅ פרטים, 🔥 מחיר, 🔗 קישור מוסתר) + פוטר קבוע.
+      ומשווה לתמונות השמורות, ומחזיר את ההתאמה הכי קרובה (עם תמונה) אם יש כזו.
 
 - /list -> אדמין בלבד: מציג את כל המוצרים בקטלוג (מזהה, מותג, מחיר, קישור).
 - /edit <id> -> אדמין בלבד: מתחיל עריכת מוצר קיים - שולחים תמונה+כיתוב חדשים
@@ -33,6 +34,7 @@
 """
 
 import html
+import io
 import json
 import logging
 import os
@@ -41,11 +43,12 @@ import uuid
 from pathlib import Path
 
 import imagehash
-from PIL import Image
-from telegram import Update
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -60,6 +63,7 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
 IMAGES_DIR = BASE_DIR / "catalog_images"
 CATALOG_FILE = BASE_DIR / "catalog.json"
+FONT_PATH = BASE_DIR / "assets" / "DejaVuSans-Bold.ttf"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # אפשר כמה אדמינים, מופרדים בפסיק: "111111,222222"
@@ -75,6 +79,10 @@ CATALOG_GROUP_ID = int(_catalog_group_raw) if _catalog_group_raw else None
 # סף דמיון לתמונות. ככל שההפרש (hamming distance) קטן יותר - התמונות דומות יותר.
 # 0 = זהה לגמרי. בערך עד 10 עדיין נחשב "אותו מוצר" בפועל (זווית/תאורה שונה קלות).
 IMAGE_MATCH_THRESHOLD = 10
+
+# כמה מוצרים מוצגים ברשת דפדוף אחת (2x2, כמו בדוגמה שהתבקשה).
+GRID_PAGE_SIZE = 4
+GRID_CELL_PX = 320
 
 # הפוטר הקבוע שמתווסף לכל תוצאת חיפוש (הזמנה, הסבר, ליווי, בוט ראשי וכו').
 # עדכן את הטקסט/הקישורים/היוזרנים כאן במקום אחד אם הם משתנים.
@@ -96,6 +104,10 @@ IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 # מצב עריכה זמני (בזיכרון, לא נשמר בין הפעלות מחדש): user_id -> product_id
 # שממתין לתמונה+כיתוב הבאים שאותו משתמש ישלח, כדי להחליף את המוצר.
 PENDING_EDITS: dict[int, str] = {}
+
+# תוצאות חיפוש/דפדוף פעילות (בזיכרון): session_id -> רשימת מזהי מוצרים,
+# כדי שכפתורי הבחירה/הדפדוף (callback_data) יישארו קצרים.
+SEARCH_SESSIONS: dict[str, list[str]] = {}
 
 
 def load_catalog() -> list[dict]:
@@ -156,12 +168,17 @@ ADD_FORMAT_HELP = (
     "צבע שחור\n"
     'מחיר: 199 ש"ח\n'
     "קישור: https://...\n\n"
-    'לחיפוש - תכתוב "חפש לי <מותג>" או פשוט תשלח תמונה.'
+    'לחיפוש - תכתוב "חפש לי <מותג>", "קטלוג" לדפדוף בהכל, או שלח תמונה.'
 )
 
 
-def format_product_message(item: dict) -> str:
-    """בונה את הודעת התוצאה המעוצבת: כותרת + פרטים + מחיר + קישור מוסתר + פוטר קבוע."""
+# ---------------------------------------------------------------------------
+# בניית הודעת/תמונת תוצאה למוצר בודד
+# ---------------------------------------------------------------------------
+
+
+def format_product_header(item: dict) -> str:
+    """כותרת + פרטים + מחיר + קישור מוסתר (בלי הפוטר הקבוע) - ה-caption של התמונה."""
     lines = [f"⭐️ <b>{html.escape(item.get('brand', ''))}</b>"]
 
     details = item.get("details") or []
@@ -177,10 +194,155 @@ def format_product_message(item: dict) -> str:
     link = html.escape(item["link"], quote=True)
     lines.append(f'🔗 קישור מוסתר - <a href="{link}">לחצו כאן להזמנה</a>')
 
-    lines.append("")
-    lines.append(RESULT_FOOTER_HTML)
-
     return "\n".join(lines)
+
+
+async def send_product_detail(bot, chat_id: int, item: dict) -> None:
+    """שולח תמונת מוצר + פרטים מעוצבים + הפוטר הקבוע. זה מה שהמשתמש בפועל רואה."""
+    header = format_product_header(item)
+    full_caption = f"{header}\n\n{RESULT_FOOTER_HTML}"
+    image_path = BASE_DIR / item["image_path"] if item.get("image_path") else None
+    has_image = image_path and image_path.exists()
+
+    if has_image and len(full_caption) <= 1024:
+        # הכל נכנס לכיתוב אחד יחד עם התמונה - הכי נקי.
+        with open(image_path, "rb") as f:
+            await bot.send_photo(
+                chat_id=chat_id, photo=f, caption=full_caption, parse_mode=ParseMode.HTML
+            )
+        return
+
+    # הכיתוב ארוך מדי בשביל תמונה אחת (מגבלת טלגרם 1024 תווים) - שולחים בנפרד.
+    if has_image:
+        with open(image_path, "rb") as f:
+            await bot.send_photo(chat_id=chat_id, photo=f, caption=header, parse_mode=ParseMode.HTML)
+        await bot.send_message(chat_id=chat_id, text=RESULT_FOOTER_HTML, parse_mode=ParseMode.HTML)
+    else:
+        # למקרה נדיר שהקובץ לא נמצא בדיסק - לפחות שולחים את הטקסט המלא.
+        await bot.send_message(
+            chat_id=chat_id,
+            text=full_caption,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# רשת דפדוף ממוספרת (2x2 עם כפתורים) - לחיפושים עם כמה תוצאות, ולדפדוף בקטלוג
+# ---------------------------------------------------------------------------
+
+
+def build_grid_image(items: list[dict]) -> io.BytesIO:
+    """מרכיב תמונה אחת עם עד 4 תמונות מוצר, כל אחת עם תגית מספר אדומה."""
+    n = len(items)
+    cols = 1 if n == 1 else 2
+    rows = 1 if n <= 2 else 2
+
+    canvas = Image.new("RGB", (cols * GRID_CELL_PX, rows * GRID_CELL_PX), "white")
+    draw = ImageDraw.Draw(canvas)
+
+    try:
+        font = ImageFont.truetype(str(FONT_PATH), 34) if FONT_PATH.exists() else ImageFont.load_default()
+    except Exception:
+        font = ImageFont.load_default()
+
+    for idx, item in enumerate(items):
+        col, row = idx % cols, idx // cols
+        x0, y0 = col * GRID_CELL_PX, row * GRID_CELL_PX
+
+        image_path = BASE_DIR / item["image_path"] if item.get("image_path") else None
+        if image_path and image_path.exists():
+            with Image.open(image_path) as img:
+                fitted = ImageOps.fit(img.convert("RGB"), (GRID_CELL_PX, GRID_CELL_PX))
+                canvas.paste(fitted, (x0, y0))
+        else:
+            draw.rectangle([x0, y0, x0 + GRID_CELL_PX, y0 + GRID_CELL_PX], fill=(230, 230, 230))
+
+        # תגית מספר אדומה בפינה השמאלית-עליונה של כל תא
+        cx, cy, r = x0 + 32, y0 + 32, 26
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(214, 39, 55), outline="white", width=3)
+        text = str(idx + 1)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text((cx - tw / 2 - bbox[0], cy - th / 2 - bbox[1]), text, fill="white", font=font)
+
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="JPEG", quality=88)
+    buffer.seek(0)
+    buffer.name = "grid.jpg"
+    return buffer
+
+
+async def send_grid_page(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session_id: str, page: int) -> None:
+    session = SEARCH_SESSIONS.get(session_id)
+    if not session:
+        await context.bot.send_message(chat_id=chat_id, text="התוצאות האלה כבר לא זמינות, נסה לחפש שוב 🙏")
+        return
+
+    start = page * GRID_PAGE_SIZE
+    page_ids = session[start : start + GRID_PAGE_SIZE]
+    if not page_ids:
+        await context.bot.send_message(chat_id=chat_id, text="אין עוד תוצאות להציג.")
+        return
+
+    catalog_by_id = {p["id"]: p for p in load_catalog()}
+    items = [catalog_by_id[pid] for pid in page_ids if pid in catalog_by_id]
+    if not items:
+        await context.bot.send_message(chat_id=chat_id, text="אין עוד תוצאות להציג.")
+        return
+
+    image_buffer = build_grid_image(items)
+
+    number_row = [
+        InlineKeyboardButton(str(i + 1), callback_data=f"sel|{session_id}|{start + i}")
+        for i in range(len(items))
+    ]
+    keyboard_rows = [number_row]
+    if start + GRID_PAGE_SIZE < len(session):
+        keyboard_rows.append(
+            [InlineKeyboardButton("עוד דגמים / צבעים 🔍", callback_data=f"pg|{session_id}|{page + 1}")]
+        )
+
+    await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=image_buffer,
+        caption="הכי קרוב שמצאתי 👇\nלחצו על המספר כדי לקבל את הפרטים והקישור 👇",
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+    )
+
+
+async def handle_grid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    parts = (query.data or "").split("|")
+    if len(parts) != 3:
+        return
+    action, session_id, arg = parts
+
+    if action == "sel":
+        session = SEARCH_SESSIONS.get(session_id)
+        if not session:
+            await context.bot.send_message(
+                chat_id=query.message.chat.id, text="התוצאות האלה כבר לא זמינות, נסה לחפש שוב 🙏"
+            )
+            return
+        idx = int(arg)
+        if idx >= len(session):
+            return
+        item = next((p for p in load_catalog() if p["id"] == session[idx]), None)
+        if not item:
+            await context.bot.send_message(chat_id=query.message.chat.id, text="המוצר הזה כבר לא קיים בקטלוג.")
+            return
+        await send_product_detail(context.bot, query.message.chat.id, item)
+
+    elif action == "pg":
+        await send_grid_page(context, query.message.chat.id, session_id, int(arg))
+
+
+# ---------------------------------------------------------------------------
+# הוספה ועריכה של מוצרים
+# ---------------------------------------------------------------------------
 
 
 async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -254,32 +416,58 @@ async def handle_edit_product(
     await update.message.reply_text(f"✏️ מוצר {product_id} עודכן!\nמותג: {item['brand'] or '—'}")
 
 
+# ---------------------------------------------------------------------------
+# חיפוש (טקסט/תמונה) ודפדוף בקטלוג
+# ---------------------------------------------------------------------------
+
+
+CATALOG_TRIGGER_WORDS = {"קטלוג", "קטלוג מלא", "תראה הכל", "תראו הכל", "כל המוצרים"}
+
+
 async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """טיפול בהודעת טקסט - מזהה 'חפש לי <משהו>' ומחפש בקטלוג."""
-    text = update.message.text or ""
+    """טיפול בהודעת טקסט - 'חפש לי <משהו>' לחיפוש, או 'קטלוג' לדפדוף בהכל."""
+    text = (update.message.text or "").strip()
+
+    if text in CATALOG_TRIGGER_WORDS:
+        await start_browse(update, context, load_catalog())
+        return
+
     match = re.match(r"^\s*חפש\s*לי\s+(.+)", text)
     if not match:
         return
 
     query = match.group(1).strip().lower()
     catalog = load_catalog()
-
     results = [item for item in catalog if query in item.get("brand", "").lower()]
 
     if not results:
         await update.message.reply_text(f'לא מצאתי מוצר שמתאים ל"{query}" 🤷')
         return
 
-    for item in results[:5]:
-        await update.message.reply_text(
-            format_product_message(item),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    await start_browse(update, context, results)
+
+
+async def start_browse(update: Update, context: ContextTypes.DEFAULT_TYPE, items: list[dict]) -> None:
+    """מתחיל דפדוף על רשימת מוצרים: תמונה בודדת+פרטים אם יש אחת, אחרת רשת ממוספרת."""
+    if not items:
+        await update.message.reply_text("הקטלוג ריק כרגע.")
+        return
+
+    if len(items) == 1:
+        await send_product_detail(context.bot, update.effective_chat.id, items[0])
+        return
+
+    session_id = uuid.uuid4().hex[:8]
+    SEARCH_SESSIONS[session_id] = [item["id"] for item in items]
+    await send_grid_page(context, update.effective_chat.id, session_id, 0)
+
+
+async def handle_catalog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start_browse(update, context, load_catalog())
 
 
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """מנתב תמונה נכנסת: עריכה ממתינה / הוספה לקטלוג / חיפוש."""
+    """מנתב תמונה נכנסת: עריכה ממתינה / הוספה לקטלוג / חיפוש לפי תמונה."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     caption = update.message.caption or ""
@@ -329,15 +517,16 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
                 best_match = item
 
         if best_match and best_distance <= IMAGE_MATCH_THRESHOLD:
-            await update.message.reply_text(
-                format_product_message(best_match),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            await send_product_detail(context.bot, chat_id, best_match)
         else:
             await update.message.reply_text("לא הצלחתי למצוא התאמה מספיק טובה לתמונה הזו 🤔")
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# פקודות ניהול
+# ---------------------------------------------------------------------------
 
 
 async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -421,7 +610,7 @@ async def handle_groupid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "היי! 👋\n"
-        'כדי לחפש מוצר - תכתוב "חפש לי <מותג>" או פשוט תשלח תמונה של המוצר.'
+        'כדי לחפש מוצר - תכתוב "חפש לי <מותג>", "קטלוג" לדפדוף בהכל, או שלח תמונה של המוצר.'
     )
 
 
@@ -444,6 +633,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("catalog", handle_catalog_command))
     app.add_handler(CommandHandler("list", handle_list))
     app.add_handler(CommandHandler("edit", handle_edit))
     app.add_handler(CommandHandler("canceledit", handle_cancel_edit))
@@ -451,6 +641,7 @@ def main() -> None:
     app.add_handler(CommandHandler("groupid", handle_groupid))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_search))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_search))
+    app.add_handler(CallbackQueryHandler(handle_grid_callback))
     app.add_error_handler(handle_error)
 
     logger.info("Bot starting...")

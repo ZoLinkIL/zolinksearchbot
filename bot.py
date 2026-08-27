@@ -7,20 +7,25 @@
        שמוגדרת ב-CATALOG_GROUP_ID נכנסת אוטומטית לקטלוג.
     2. הודעה פרטית לבוט מאדמין (מי שה-ID שלו ב-ADMIN_IDS) - אותו פורמט כיתוב.
   פורמט הכיתוב:
-    מותג: שם המותג
-    שם: שם המוצר (אופציונלי)
+    מותג: שם המותג והדגם
+    פרטים: (כל שורה הופכת לנקודה משלה)
+    מידה 40-45
+    צבע שחור
+    מחיר: 199 ש"ח
     קישור: https://...
 
 - כל משתמש אחר (בצ'אט פרטי או בקבוצה אחרת, לא קבוצת ההעלאה) יכול:
     - לכתוב "חפש לי <מותג>" -> הבוט מחפש התאמה טקסטואלית בקטלוג.
     - לשלוח תמונה -> הבוט מחשב טביעת אצבע ויזואלית (perceptual hash)
       ומשווה לתמונות השמורות, ומחזיר את ההתאמה הכי קרובה אם יש כזו.
+  התוצאה חוזרת מעוצבת (⭐️ מותג, ✅ פרטים, 🔥 מחיר, 🔗 קישור מוסתר) + פוטר קבוע.
 
 - /list -> אדמין בלבד: מציג את כל המוצרים בקטלוג.
 - /delete <id> -> אדמין בלבד: מוחק מוצר מהקטלוג.
 - /groupid -> מציג את מזהה הקבוצה הנוכחית (שימושי כדי להגדיר CATALOG_GROUP_ID).
 """
 
+import html
 import json
 import logging
 import os
@@ -31,6 +36,7 @@ from pathlib import Path
 import imagehash
 from PIL import Image
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -63,6 +69,21 @@ CATALOG_GROUP_ID = int(_catalog_group_raw) if _catalog_group_raw else None
 # 0 = זהה לגמרי. בערך עד 10 עדיין נחשב "אותו מוצר" בפועל (זווית/תאורה שונה קלות).
 IMAGE_MATCH_THRESHOLD = 10
 
+# הפוטר הקבוע שמתווסף לכל תוצאת חיפוש (הזמנה, הסבר, ליווי, בוט ראשי וכו').
+# עדכן את הטקסט/הקישורים/היוזרנים כאן במקום אחד אם הם משתנים.
+RESULT_FOOTER_HTML = (
+    "❓ איך מזמינים? על כל דגם בתמונה מופיע מספר / קוד. נכנסים לקישור, "
+    "בוחרים ב- Flylinking את הקוד התואם למה שרציתם ומזמינים. "
+    "אין צורך לשלוח הודעה למוכר!\n\n"
+    '❓ סרטון הסבר איך להזמין דרך קישור מוסתר - '
+    '<a href="https://t.me/ZoLinkisrael/28">לחצו כאן לצפייה</a>\n\n'
+    "מי שמחפש דגם ספציפי מוזמן לשלוח אליי בפרטי @ZoLinkIL\n\n"
+    "אנחנו מתווכים בלבד ולא הספקים או חברת השליחויות, ברגע שאתם מזמינים "
+    "מהלינק אתם לקוחות של אותו האתר ואין לנו אחריות על אותן הזמנות.\n\n"
+    "כמובן שהבוט עדיין פעיל למוצרים רגילים:\n"
+    "@zolinkil_bot 👈"
+)
+
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -88,18 +109,67 @@ def is_catalog_group(chat_id: int) -> bool:
 
 
 def parse_caption(caption: str) -> dict:
-    """מפרסר כיתוב בפורמט 'מותג: X\nשם: Y\nקישור: Z' לדיקט."""
-    fields = {"brand": "", "name": "", "link": ""}
-    patterns = {
-        "brand": r"מותג\s*:\s*(.+)",
-        "name": r"שם\s*:\s*(.+)",
-        "link": r"קישור\s*:\s*(\S+)",
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, caption)
-        if match:
-            fields[key] = match.group(1).strip()
+    """מפרסר כיתוב בפורמט 'מותג: X\nפרטים: ...\nמחיר: Y\nקישור: Z' לדיקט.
+    'פרטים' יכול להכיל כמה שורות - כל שורה לא ריקה הופכת לנקודה נפרדת."""
+    fields = {"brand": "", "details": [], "price": "", "link": ""}
+
+    brand_match = re.search(r"מותג\s*:\s*(.+)", caption)
+    if brand_match:
+        fields["brand"] = brand_match.group(1).strip()
+
+    details_match = re.search(
+        r"פרטים\s*:\s*(.+?)(?=\n\s*(?:מחיר|קישור)\s*:|\Z)", caption, re.DOTALL
+    )
+    if details_match:
+        raw_lines = details_match.group(1).splitlines()
+        fields["details"] = [
+            re.sub(r"^[-•*]\s*", "", line).strip() for line in raw_lines if line.strip()
+        ]
+
+    price_match = re.search(r"מחיר\s*:\s*(.+?)(?=\n\s*קישור\s*:|\Z)", caption, re.DOTALL)
+    if price_match:
+        fields["price"] = price_match.group(1).strip()
+
+    link_match = re.search(r"קישור\s*:\s*(\S+)", caption)
+    if link_match:
+        fields["link"] = link_match.group(1).strip()
+
     return fields
+
+
+ADD_FORMAT_HELP = (
+    "כדי להוסיף מוצר, שלח תמונה עם כיתוב בפורמט:\n\n"
+    "מותג: שם המותג והדגם\n"
+    "פרטים:\n"
+    "מידה 40-45\n"
+    "צבע שחור\n"
+    'מחיר: 199 ש"ח\n'
+    "קישור: https://...\n\n"
+    'לחיפוש - תכתוב "חפש לי <מותג>" או פשוט תשלח תמונה.'
+)
+
+
+def format_product_message(item: dict) -> str:
+    """בונה את הודעת התוצאה המעוצבת: כותרת + פרטים + מחיר + קישור מוסתר + פוטר קבוע."""
+    lines = [f"⭐️ <b>{html.escape(item.get('brand', ''))}</b>"]
+
+    details = item.get("details") or []
+    if details:
+        lines.append("")
+        lines.extend(f"✅ {html.escape(d)}" for d in details)
+
+    if item.get("price"):
+        lines.append("")
+        lines.append(f"🔥 מחיר: {html.escape(item['price'])}")
+
+    lines.append("")
+    link = html.escape(item["link"], quote=True)
+    lines.append(f'🔗 קישור מוסתר - <a href="{link}">לחצו כאן להזמנה</a>')
+
+    lines.append("")
+    lines.append(RESULT_FOOTER_HTML)
+
+    return "\n".join(lines)
 
 
 async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -109,13 +179,7 @@ async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
     fields = parse_caption(caption)
 
     if not fields["link"]:
-        await update.message.reply_text(
-            "כדי להוסיף מוצר, שלח תמונה עם כיתוב בפורמט:\n\n"
-            "מותג: שם המותג\n"
-            "שם: שם המוצר (אופציונלי)\n"
-            "קישור: https://...\n\n"
-            'לחיפוש - תכתוב "חפש לי <מותג>" או פשוט תשלח תמונה.'
-        )
+        await update.message.reply_text(ADD_FORMAT_HELP)
         return
 
     photo = update.message.photo[-1]  # הגודל הכי גדול
@@ -132,7 +196,8 @@ async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
         {
             "id": product_id,
             "brand": fields["brand"],
-            "name": fields["name"],
+            "details": fields["details"],
+            "price": fields["price"],
             "link": fields["link"],
             "image_path": str(image_path.relative_to(BASE_DIR)),
             "phash": phash,
@@ -141,7 +206,7 @@ async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_catalog(catalog)
 
     await update.message.reply_text(
-        f"✅ נוסף לקטלוג!\nמזהה: {product_id}\nמותג: {fields['brand'] or '—'}\nשם: {fields['name'] or '—'}"
+        f"✅ נוסף לקטלוג!\nמזהה: {product_id}\nמותג: {fields['brand'] or '—'}"
     )
 
 
@@ -155,19 +220,18 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = match.group(1).strip().lower()
     catalog = load_catalog()
 
-    results = [
-        item
-        for item in catalog
-        if query in item.get("brand", "").lower() or query in item.get("name", "").lower()
-    ]
+    results = [item for item in catalog if query in item.get("brand", "").lower()]
 
     if not results:
         await update.message.reply_text(f'לא מצאתי מוצר שמתאים ל"{query}" 🤷')
         return
 
     for item in results[:5]:
-        caption = f"{item.get('brand', '')} {item.get('name', '')}".strip()
-        await update.message.reply_text(f"{caption}\n{item['link']}")
+        await update.message.reply_text(
+            format_product_message(item),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -182,10 +246,7 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
         if has_valid_caption:
             await handle_add_product(update, context)
         else:
-            await update.message.reply_text(
-                "כדי להוסיף מוצר, צריך כיתוב בפורמט:\n\n"
-                "מותג: שם המותג\nשם: שם המוצר (אופציונלי)\nקישור: https://..."
-            )
+            await update.message.reply_text(ADD_FORMAT_HELP)
         return
 
     # 2. אדמין בצ'אט פרטי עם כיתוב תקין -> הוספה (השיטה הישנה, עדיין נתמכת)
@@ -218,8 +279,11 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
                 best_match = item
 
         if best_match and best_distance <= IMAGE_MATCH_THRESHOLD:
-            caption_out = f"{best_match.get('brand', '')} {best_match.get('name', '')}".strip()
-            await update.message.reply_text(f"מצאתי! ✅\n{caption_out}\n{best_match['link']}")
+            await update.message.reply_text(
+                format_product_message(best_match),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
         else:
             await update.message.reply_text("לא הצלחתי למצוא התאמה מספיק טובה לתמונה הזו 🤔")
     finally:
@@ -233,9 +297,7 @@ async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not catalog:
         await update.message.reply_text("הקטלוג ריק.")
         return
-    lines = [
-        f"{item['id']} | {item.get('brand', '—')} | {item.get('name', '—')}" for item in catalog
-    ]
+    lines = [f"{item['id']} | {item.get('brand', '—')}" for item in catalog]
     # טלגרם מגביל אורך הודעה - נחלק לצ'אנקים אם צריך
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):

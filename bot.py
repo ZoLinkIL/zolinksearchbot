@@ -15,9 +15,11 @@
     קישור: https://...
 
 - כל משתמש אחר (בצ'אט פרטי או בקבוצה אחרת, לא קבוצת ההעלאה) יכול:
-    - לכתוב "חפש לי <מותג>" -> אם יש תוצאה אחת, מקבל תמונה+פרטים מלאים.
-      אם יש כמה תוצאות, מקבל רשת תמונות ממוספרת עם כפתורים לבחירה.
-      אם אין תוצאות, נשלחת התראה לקבוצת האדמין (NOTIFY_GROUP_ID) עם מה שחיפש.
+    - לכתוב "חפש לי <מותג>" -> חיפוש מפורש. אם יש תוצאה אחת, מקבל תמונה+פרטים
+      מלאים. אם יש כמה, מקבל רשת ממוספרת. בלי תוצאה - "לא מצאתי" + התראה לאדמין.
+    - לכתוב שם מותג ישירות, בלי "חפש לי" (למשל סתם "נייקי") -> אותו חיפוש,
+      אבל אם אין התאמה הבוט שותק (כדי לא להגיב "לא מצאתי" על כל הודעת צ'אט
+      סתמית). ההתנהגות הזו כבויה בקבוצת ההעלאה עצמה.
     - לכתוב "קטלוג" (או /catalog) -> רשת דפדוף על כל המוצרים בקטלוג.
     - לשלוח תמונה -> אם ENABLE_IMAGE_SEARCH=false (ברירת מחדל: true), הבוט לא
       מנסה להתאים בכלל - מודיע למשתמש ומעביר את התמונה לקבוצת האדמין.
@@ -484,29 +486,46 @@ CATALOG_TRIGGER_WORDS = {"קטלוג", "קטלוג מלא", "תראה הכל", "
 
 
 async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """טיפול בהודעת טקסט - 'חפש לי <משהו>' לחיפוש, או 'קטלוג' לדפדוף בהכל."""
+    """טיפול בהודעת טקסט:
+    - 'קטלוג' -> דפדוף בהכל.
+    - 'חפש לי X' -> חיפוש מפורש. בלי תוצאה: מגיב "לא מצאתי" + מתריע לאדמין.
+    - כל טקסט אחר (לא בקבוצת ההעלאה) -> מנסה להתאים כשם מותג ישירות (בלי
+      צורך לכתוב "חפש לי"). אם לא נמצאה התאמה - שקט, כדי לא "לתקוע" תגובת
+      שגיאה על כל הודעת צ'אט סתמית שלא הייתה כוונתה בכלל לחפש מוצר.
+    """
     text = (update.message.text or "").strip()
+    if not text:
+        return
 
     if text in CATALOG_TRIGGER_WORDS:
         await start_browse(update, context, load_catalog())
         return
 
-    match = re.match(r"^\s*חפש\s*לי\s+(.+)", text)
-    if not match:
-        return
-
-    query = match.group(1).strip().lower()
     catalog = load_catalog()
-    results = [item for item in catalog if query in item.get("brand", "").lower()]
 
-    if not results:
-        await update.message.reply_text(f'לא מצאתי מוצר שמתאים ל"{query}" 🤷')
-        await notify_admin_group(
-            context, f"🔎 חיפוש ללא תוצאה\nמאת: {describe_user(update)}\nחיפש: \"{query}\""
-        )
+    explicit_match = re.match(r"^\s*חפש\s*לי\s+(.+)", text)
+    if explicit_match:
+        query = explicit_match.group(1).strip().lower()
+        results = [item for item in catalog if query in item.get("brand", "").lower()]
+        if not results:
+            await update.message.reply_text(f'לא מצאתי מוצר שמתאים ל"{query}" 🤷')
+            await notify_admin_group(
+                context, f"🔎 חיפוש ללא תוצאה\nמאת: {describe_user(update)}\nחיפש: \"{query}\""
+            )
+            return
+        await start_browse(update, context, results)
         return
 
-    await start_browse(update, context, results)
+    # חיפוש משתמע - טקסט חופשי שלא מתחיל ב"חפש לי". לא פעיל בקבוצת ההעלאה
+    # (שם טקסט חופשי הוא לרוב שיחה בין אדמינים, לא בקשת חיפוש של לקוח).
+    if is_catalog_group(update.effective_chat.id):
+        return
+
+    query = text.strip().lower()
+    results = [item for item in catalog if query in item.get("brand", "").lower()]
+    if results:
+        await start_browse(update, context, results)
+    # אין תוצאה -> שקט בכוונה (ראה docstring למעלה)
 
 
 async def start_browse(update: Update, context: ContextTypes.DEFAULT_TYPE, items: list[dict]) -> None:

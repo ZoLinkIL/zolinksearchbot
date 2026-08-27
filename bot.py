@@ -61,8 +61,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
-IMAGES_DIR = BASE_DIR / "catalog_images"
-CATALOG_FILE = BASE_DIR / "catalog.json"
+# תיקיית שמירה לקטלוג/תמונות. ברירת מחדל - לצד הקוד עצמו (טוב להרצה מקומית).
+# ב-Railway/Render מומלץ להצביע ל-Volume קבוע (למשל CATALOG_DIR=/data) כדי
+# שהמוצרים לא יימחקו בכל Redeploy - ראה README, סעיף "אחסון קבוע".
+DATA_DIR = Path(os.environ.get("CATALOG_DIR", str(BASE_DIR)))
+IMAGES_DIR = DATA_DIR / "catalog_images"
+CATALOG_FILE = DATA_DIR / "catalog.json"
 FONT_PATH = BASE_DIR / "assets" / "DejaVuSans-Bold.ttf"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -201,7 +205,7 @@ async def send_product_detail(bot, chat_id: int, item: dict) -> None:
     """שולח תמונת מוצר + פרטים מעוצבים + הפוטר הקבוע. זה מה שהמשתמש בפועל רואה."""
     header = format_product_header(item)
     full_caption = f"{header}\n\n{RESULT_FOOTER_HTML}"
-    image_path = BASE_DIR / item["image_path"] if item.get("image_path") else None
+    image_path = DATA_DIR / item["image_path"] if item.get("image_path") else None
     has_image = image_path and image_path.exists()
 
     if has_image and len(full_caption) <= 1024:
@@ -250,7 +254,7 @@ def build_grid_image(items: list[dict]) -> io.BytesIO:
         col, row = idx % cols, idx // cols
         x0, y0 = col * GRID_CELL_PX, row * GRID_CELL_PX
 
-        image_path = BASE_DIR / item["image_path"] if item.get("image_path") else None
+        image_path = DATA_DIR / item["image_path"] if item.get("image_path") else None
         if image_path and image_path.exists():
             with Image.open(image_path) as img:
                 fitted = ImageOps.fit(img.convert("RGB"), (GRID_CELL_PX, GRID_CELL_PX))
@@ -372,7 +376,7 @@ async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "details": fields["details"],
             "price": fields["price"],
             "link": fields["link"],
-            "image_path": str(image_path.relative_to(BASE_DIR)),
+            "image_path": str(image_path.relative_to(DATA_DIR)),
             "phash": phash,
         }
     )
@@ -408,7 +412,7 @@ async def handle_edit_product(
     item["price"] = fields["price"] or item.get("price", "")
     item["link"] = fields["link"] or item.get("link", "")
     item["phash"] = str(imagehash.phash(Image.open(image_path)))
-    item["image_path"] = str(image_path.relative_to(BASE_DIR))
+    item["image_path"] = str(image_path.relative_to(DATA_DIR))
 
     catalog[idx] = item
     save_catalog(catalog)
@@ -595,7 +599,7 @@ async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     removed = next(item for item in catalog if item["id"] == product_id)
-    image_path = BASE_DIR / removed["image_path"]
+    image_path = DATA_DIR / removed["image_path"]
     image_path.unlink(missing_ok=True)
 
     save_catalog(new_catalog)

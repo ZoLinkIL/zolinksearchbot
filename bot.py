@@ -3,8 +3,9 @@
 
 איך זה עובד:
 - הוספת מוצרים אפשרית בשתי דרכים (אפשר להשתמש בשתיהן ביחד):
-    1. קבוצת "העלאת מוצרים" נפרדת - כל תמונה עם כיתוב תקין שנשלחת בקבוצה
-       שמוגדרת ב-CATALOG_GROUP_ID נכנסת אוטומטית לקטלוג.
+    1. קבוצת "העלאת מוצרים" נפרדת - כל תמונה (או כמה תמונות ביחד כ"אלבום")
+       עם כיתוב תקין שנשלחת בקבוצה שמוגדרת ב-CATALOG_GROUP_ID נכנסת
+       אוטומטית לקטלוג כמוצר אחד.
     2. הודעה פרטית לבוט מאדמין (מי שה-ID שלו ב-ADMIN_IDS) - אותו פורמט כיתוב.
   פורמט הכיתוב:
     מותג: שם המותג והדגם
@@ -13,6 +14,11 @@
     צבע שחור
     מחיר: 199 ש"ח
     קישור: https://...
+
+  אפשר לשלוח כמה תמונות ביחד (כ"אלבום" בטלגרם) עם כיתוב אחד - כולן יישמרו
+  תחת אותו מוצר, וייחשלו יחד כאלבום גם כשהמוצר מוצג. הבוט אוסף את כל
+  התמונות של אותו אלבום (הן מגיעות כהודעות נפרדות מטלגרם) וממתין רגע קט
+  (MEDIA_GROUP_DEBOUNCE_SECONDS) לפני שהוא שומר את המוצר.
 
 - כל משתמש אחר (בצ'אט פרטי או בקבוצה אחרת, לא קבוצת ההעלאה) יכול:
     - לכתוב "חפש לי <מותג>" -> חיפוש מפורש. אם יש תוצאה אחת, מקבל תמונה+פרטים
@@ -50,7 +56,7 @@ from pathlib import Path
 
 import imagehash
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -137,21 +143,34 @@ PENDING_EDITS: dict[int, str] = {}
 # כדי שכפתורי הבחירה/הדפדוף (callback_data) יישארו קצרים.
 SEARCH_SESSIONS: dict[str, list[str]] = {}
 
+# מאגר זמני לאיסוף "אלבום" תמונות (media group) שנשלח כמה תמונות ביחד.
+# טלגרם מספק כל תמונה כהודעה נפרדת עם אותו media_group_id, והכיתוב מגיע רק
+# על אחת מהן - לכן אוספים לפי media_group_id וממתינים רגע (MEDIA_GROUP_DEBOUNCE_SECONDS)
+# לפני שמעבדים את כולן ביחד כמוצר אחד עם כמה תמונות.
+MEDIA_GROUP_BUFFERS: dict[str, dict] = {}
+MEDIA_GROUP_DEBOUNCE_SECONDS = 1.5
 
-def describe_user(update: Update) -> str:
-    """מחרוזת קצרה לזיהוי מי שלח את הפנייה, לשימוש בהתראות לאדמין."""
+
+def user_mention_html(update: Update) -> str:
+    """קישור HTML שאפשר ללחוץ עליו כדי לפתוח את הפרופיל של השולח - עובד גם
+    אם אין לו @username. משמש בהתראות לאדמין כדי "לתייג" ולהגיע אליו ישירות."""
     user = update.effective_user
-    name = user.full_name or "משתמש"
-    handle = f"@{user.username}" if user.username else f"id:{user.id}"
-    return f"{name} ({handle})"
+    name = html.escape(user.full_name or "משתמש")
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
 
 
 async def notify_admin_group(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """שולח הודעת התראה לקבוצת האדמין, אם היא מוגדרת (NOTIFY_GROUP_ID)."""
+    """שולח הודעת התראה לקבוצת האדמין, אם היא מוגדרת (NOTIFY_GROUP_ID).
+    text יכול להכיל HTML (למשל תיוג לחיץ מ-user_mention_html)."""
     if NOTIFY_GROUP_ID is None:
         return
     try:
-        await context.bot.send_message(chat_id=NOTIFY_GROUP_ID, text=text, disable_web_page_preview=True)
+        await context.bot.send_message(
+            chat_id=NOTIFY_GROUP_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except Exception:
         logger.exception("Failed to send admin notification")
 
@@ -159,13 +178,34 @@ async def notify_admin_group(context: ContextTypes.DEFAULT_TYPE, text: str) -> N
 async def notify_admin_group_photo(
     context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: str
 ) -> None:
-    """מעביר תמונה שהתקבלה לחיפוש (בלי שנמצאה התאמה/כשזיהוי תמונות כבוי) לקבוצת האדמין."""
+    """מעביר תמונה שהתקבלה לחיפוש (בלי שנמצאה התאמה/כשזיהוי תמונות כבוי) לקבוצת האדמין.
+    caption יכול להכיל HTML (למשל תיוג לחיץ מ-user_mention_html)."""
     if NOTIFY_GROUP_ID is None:
         return
     try:
-        await context.bot.send_photo(chat_id=NOTIFY_GROUP_ID, photo=file_id, caption=caption)
+        await context.bot.send_photo(
+            chat_id=NOTIFY_GROUP_ID, photo=file_id, caption=caption, parse_mode=ParseMode.HTML
+        )
     except Exception:
         logger.exception("Failed to send admin photo notification")
+
+
+def item_image_paths(item: dict) -> list[str]:
+    """מחזיר את רשימת נתיבי התמונות של מוצר (תומך גם במוצרים ישנים עם image_path יחיד)."""
+    if item.get("image_paths"):
+        return item["image_paths"]
+    if item.get("image_path"):
+        return [item["image_path"]]
+    return []
+
+
+def item_phashes(item: dict) -> list[str]:
+    """מחזיר את רשימת טביעות האצבע של מוצר (תומך גם במוצרים ישנים עם phash יחיד)."""
+    if item.get("phashes"):
+        return item["phashes"]
+    if item.get("phash"):
+        return [item["phash"]]
+    return []
 
 
 def load_catalog() -> list[dict]:
@@ -256,32 +296,52 @@ def format_product_header(item: dict) -> str:
 
 
 async def send_product_detail(bot, chat_id: int, item: dict) -> None:
-    """שולח תמונת מוצר + פרטים מעוצבים + הפוטר הקבוע. זה מה שהמשתמש בפועל רואה."""
+    """שולח תמונות מוצר (אחת או כמה כאלבום) + פרטים מעוצבים + הפוטר הקבוע."""
     header = format_product_header(item)
     full_caption = f"{header}\n\n{RESULT_FOOTER_HTML}"
-    image_path = DATA_DIR / item["image_path"] if item.get("image_path") else None
-    has_image = image_path and image_path.exists()
 
-    if has_image and len(full_caption) <= 1024:
-        # הכל נכנס לכיתוב אחד יחד עם התמונה - הכי נקי.
-        with open(image_path, "rb") as f:
-            await bot.send_photo(
-                chat_id=chat_id, photo=f, caption=full_caption, parse_mode=ParseMode.HTML
-            )
+    paths = [DATA_DIR / p for p in item_image_paths(item)]
+    paths = [p for p in paths if p.exists()][:10]  # מגבלת טלגרם: עד 10 תמונות באלבום
+
+    if not paths:
+        # אין אף תמונה שמורה בדיסק - לפחות שולחים את הטקסט המלא.
+        await bot.send_message(
+            chat_id=chat_id, text=full_caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        )
         return
 
-    # הכיתוב ארוך מדי בשביל תמונה אחת (מגבלת טלגרם 1024 תווים) - שולחים בנפרד.
-    if has_image:
-        with open(image_path, "rb") as f:
+    if len(paths) == 1:
+        if len(full_caption) <= 1024:
+            with open(paths[0], "rb") as f:
+                await bot.send_photo(
+                    chat_id=chat_id, photo=f, caption=full_caption, parse_mode=ParseMode.HTML
+                )
+            return
+        # הכיתוב ארוך מדי בשביל תמונה אחת (מגבלת טלגרם 1024 תווים) - שולחים בנפרד.
+        with open(paths[0], "rb") as f:
             await bot.send_photo(chat_id=chat_id, photo=f, caption=header, parse_mode=ParseMode.HTML)
         await bot.send_message(chat_id=chat_id, text=RESULT_FOOTER_HTML, parse_mode=ParseMode.HTML)
-    else:
-        # למקרה נדיר שהקובץ לא נמצא בדיסק - לפחות שולחים את הטקסט המלא.
+        return
+
+    # כמה תמונות - שולחים כאלבום. הכיתוב (אם נכנס במגבלה) יושב על התמונה הראשונה בלבד.
+    caption_for_album = full_caption if len(full_caption) <= 1024 else None
+    open_files = [open(p, "rb") for p in paths]
+    try:
+        media = [
+            InputMediaPhoto(media=f, caption=caption_for_album, parse_mode=ParseMode.HTML)
+            if i == 0 and caption_for_album
+            else InputMediaPhoto(media=f)
+            for i, f in enumerate(open_files)
+        ]
+        await bot.send_media_group(chat_id=chat_id, media=media)
+    finally:
+        for f in open_files:
+            f.close()
+
+    if caption_for_album is None:
+        # הכיתוב לא נכנס לתמונה - שולחים אותו כהודעת טקסט נפרדת אחרי האלבום.
         await bot.send_message(
-            chat_id=chat_id,
-            text=full_caption,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            chat_id=chat_id, text=full_caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
 
 
@@ -308,7 +368,7 @@ def build_grid_image(items: list[dict]) -> io.BytesIO:
         col, row = idx % cols, idx // cols
         x0, y0 = col * GRID_CELL_PX, row * GRID_CELL_PX
 
-        image_path = DATA_DIR / item["image_path"] if item.get("image_path") else None
+        image_path = DATA_DIR / item_image_paths(item)[0] if item_image_paths(item) else None
         if image_path and image_path.exists():
             with Image.open(image_path) as img:
                 fitted = ImageOps.fit(img.convert("RGB"), (GRID_CELL_PX, GRID_CELL_PX))
@@ -406,24 +466,26 @@ async def handle_grid_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # ---------------------------------------------------------------------------
 
 
-async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """מוסיף מוצר לקטלוג מתמונה עם כיתוב. הקריאה לפונקציה הזו כבר מניחה שהמקור מורשה
-    (קבוצת ההעלאה, או אדמין בצ'אט פרטי) - הבדיקה נעשית ב-handle_photo_search."""
-    caption = update.message.caption or ""
-    fields = parse_caption(caption)
+async def save_new_product(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, caption: str, file_ids: list[str]
+) -> None:
+    """מוסיף מוצר לקטלוג מתמונה אחת או כמה (אלבום) + כיתוב. הקריאה לפונקציה הזו
+    כבר מניחה שהמקור מורשה (קבוצת ההעלאה, או אדמין בצ'אט פרטי)."""
+    fields = parse_caption(caption or "")
 
     if not fields["link"]:
-        await update.message.reply_text(ADD_FORMAT_HELP)
+        await context.bot.send_message(chat_id=chat_id, text=ADD_FORMAT_HELP)
         return
 
-    photo = update.message.photo[-1]  # הגודל הכי גדול
-    file = await context.bot.get_file(photo.file_id)
-
     product_id = str(uuid.uuid4())[:8]
-    image_path = IMAGES_DIR / f"{product_id}.jpg"
-    await file.download_to_drive(str(image_path))
-
-    phash = str(imagehash.phash(Image.open(image_path)))
+    image_paths: list[str] = []
+    phashes: list[str] = []
+    for idx, file_id in enumerate(file_ids):
+        file = await context.bot.get_file(file_id)
+        path = IMAGES_DIR / f"{product_id}_{idx}.jpg"
+        await file.download_to_drive(str(path))
+        image_paths.append(str(path.relative_to(DATA_DIR)))
+        phashes.append(str(imagehash.phash(Image.open(path))))
 
     catalog = load_catalog()
     catalog.append(
@@ -433,48 +495,68 @@ async def handle_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "details": fields["details"],
             "price": fields["price"],
             "link": fields["link"],
-            "image_path": str(image_path.relative_to(DATA_DIR)),
-            "phash": phash,
+            "image_paths": image_paths,
+            "phashes": phashes,
         }
     )
     save_catalog(catalog)
 
-    await update.message.reply_text(
-        f"✅ נוסף לקטלוג!\nמזהה: {product_id}\nמותג: {fields['brand'] or '—'}"
+    photo_count_note = f" ({len(image_paths)} תמונות)" if len(image_paths) > 1 else ""
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"✅ נוסף לקטלוג!{photo_count_note}\nמזהה: {product_id}\nמותג: {fields['brand'] or '—'}",
     )
 
 
-async def handle_edit_product(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: str
+async def apply_edit(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    product_id: str,
+    caption: str,
+    file_ids: list[str],
 ) -> None:
-    """מחליף שדות/תמונה של מוצר קיים. שדה ריק בכיתוב החדש משאיר את הערך הישן."""
+    """מחליף שדות/תמונות של מוצר קיים. שדה ריק בכיתוב החדש משאיר את הערך הישן."""
     catalog = load_catalog()
     idx = next((i for i, p in enumerate(catalog) if p["id"] == product_id), None)
     if idx is None:
-        await update.message.reply_text(
-            f"המוצר {product_id} כבר לא קיים בקטלוג - העריכה בוטלה."
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"המוצר {product_id} כבר לא קיים בקטלוג - העריכה בוטלה."
         )
         return
 
     item = catalog[idx]
-    fields = parse_caption(update.message.caption or "")
+    fields = parse_caption(caption or "")
 
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    image_path = IMAGES_DIR / f"{product_id}.jpg"
-    await file.download_to_drive(str(image_path))
+    # מנקים את קבצי התמונה הישנים לפני שכותבים את החדשים, כדי לא להשאיר יתומים.
+    for old_path in item_image_paths(item):
+        (DATA_DIR / old_path).unlink(missing_ok=True)
+
+    image_paths: list[str] = []
+    phashes: list[str] = []
+    for i, file_id in enumerate(file_ids):
+        file = await context.bot.get_file(file_id)
+        path = IMAGES_DIR / f"{product_id}_{i}.jpg"
+        await file.download_to_drive(str(path))
+        image_paths.append(str(path.relative_to(DATA_DIR)))
+        phashes.append(str(imagehash.phash(Image.open(path))))
 
     item["brand"] = fields["brand"] or item.get("brand", "")
     item["details"] = fields["details"] or item.get("details", [])
     item["price"] = fields["price"] or item.get("price", "")
     item["link"] = fields["link"] or item.get("link", "")
-    item["phash"] = str(imagehash.phash(Image.open(image_path)))
-    item["image_path"] = str(image_path.relative_to(DATA_DIR))
+    item["image_paths"] = image_paths
+    item["phashes"] = phashes
+    item.pop("image_path", None)  # מיגרציה מהסכמה הישנה (תמונה יחידה)
+    item.pop("phash", None)
 
     catalog[idx] = item
     save_catalog(catalog)
 
-    await update.message.reply_text(f"✏️ מוצר {product_id} עודכן!\nמותג: {item['brand'] or '—'}")
+    photo_count_note = f" ({len(image_paths)} תמונות)" if len(image_paths) > 1 else ""
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"✏️ מוצר {product_id} עודכן!{photo_count_note}\nמותג: {item['brand'] or '—'}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +592,8 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not results:
             await update.message.reply_text(f'לא מצאתי מוצר שמתאים ל"{query}" 🤷')
             await notify_admin_group(
-                context, f"🔎 חיפוש ללא תוצאה\nמאת: {describe_user(update)}\nחיפש: \"{query}\""
+                context,
+                f"🔎 חיפוש ללא תוצאה\nמאת: {user_mention_html(update)}\nחיפש: \"{html.escape(query)}\"",
             )
             return
         await start_browse(update, context, results)
@@ -547,56 +630,61 @@ async def handle_catalog_command(update: Update, context: ContextTypes.DEFAULT_T
     await start_browse(update, context, load_catalog())
 
 
-async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """מנתב תמונה נכנסת: עריכה ממתינה / הוספה לקטלוג / חיפוש לפי תמונה."""
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    caption = update.message.caption or ""
-    has_valid_caption = bool(parse_caption(caption).get("link"))
+async def route_incoming_photos(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    caption: str,
+    file_ids: list[str],
+    mention_html: str,
+) -> None:
+    """הלוגיקה המשותפת לניתוב תמונה/אלבום תמונות שהתקבל: עריכה ממתינה / הוספה
+    לקטלוג / חיפוש לפי תמונה. עובדת גם עבור תמונה בודדת מיידית וגם עבור אלבום
+    שנאסף במאגר הזמני ומעובד אחרי דיליי קצר (ראה handle_photo_search)."""
+    has_valid_caption = bool(parse_caption(caption or "").get("link"))
 
     # 0. יש עריכה ממתינה למשתמש הזה (מ-/edit) -> תמיד עדיפות ראשונה
-    pending_product_id = PENDING_EDITS.pop(user.id, None)
+    pending_product_id = PENDING_EDITS.pop(user_id, None)
     if pending_product_id is not None:
-        await handle_edit_product(update, context, pending_product_id)
+        await apply_edit(context, chat_id, pending_product_id, caption, file_ids)
         return
 
     # 1. הודעה בקבוצת ההעלאה המיועדת -> תמיד ניסיון הוספה (לא תלוי מי שלח)
     if is_catalog_group(chat_id):
         if has_valid_caption:
-            await handle_add_product(update, context)
+            await save_new_product(context, chat_id, caption, file_ids)
         else:
-            await update.message.reply_text(ADD_FORMAT_HELP)
+            await context.bot.send_message(chat_id=chat_id, text=ADD_FORMAT_HELP)
         return
 
     # 2. אדמין בצ'אט פרטי עם כיתוב תקין -> הוספה (השיטה הישנה, עדיין נתמכת)
-    if is_admin(user.id) and has_valid_caption:
-        await handle_add_product(update, context)
+    if is_admin(user_id) and has_valid_caption:
+        await save_new_product(context, chat_id, caption, file_ids)
         return
 
-    # 3. חיפוש לפי תמונה - אם כבוי (ENABLE_IMAGE_SEARCH=false), לא מנסים להתאים
-    # בכלל: מודיעים למשתמש ומעבירים את התמונה לקבוצת האדמין לטיפול ידני.
-    photo = update.message.photo[-1]
+    # 3. חיפוש לפי תמונה - משתמשים תמיד רק בתמונה הראשונה מהאלבום (אם נשלחו כמה)
+    first_file_id = file_ids[0]
 
     if not ENABLE_IMAGE_SEARCH:
-        await update.message.reply_text(
-            "🔍 חיפוש לפי תמונה כרגע לא זמין.\n"
-            'תכתבו לי מה אתם מחפשים (למשל "חפש לי נייקי") ואשמח לעזור - '
-            "או שנחזור אליכם ישירות בקרוב 🙏"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🔍 חיפוש לפי תמונה כרגע לא זמין.\n"
+                'תכתבו לי מה אתם מחפשים (למשל "חפש לי נייקי") ואשמח לעזור - '
+                "או שנחזור אליכם ישירות בקרוב 🙏"
+            ),
         )
         await notify_admin_group_photo(
-            context,
-            photo.file_id,
-            f"📸 בקשת חיפוש לפי תמונה (זיהוי תמונות כבוי)\nמאת: {describe_user(update)}",
+            context, first_file_id, f"📸 בקשת חיפוש לפי תמונה (זיהוי תמונות כבוי)\nמאת: {mention_html}"
         )
         return
 
     catalog = load_catalog()
     if not catalog:
-        await update.message.reply_text("הקטלוג עדיין ריק, אין מה לחפש בו כרגע.")
+        await context.bot.send_message(chat_id=chat_id, text="הקטלוג עדיין ריק, אין מה לחפש בו כרגע.")
         return
 
-    file = await context.bot.get_file(photo.file_id)
-
+    file = await context.bot.get_file(first_file_id)
     tmp_path = IMAGES_DIR / f"_search_{uuid.uuid4().hex[:8]}.jpg"
     await file.download_to_drive(str(tmp_path))
 
@@ -606,21 +694,72 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
         best_match = None
         best_distance = None
         for item in catalog:
-            item_hash = imagehash.hex_to_hash(item["phash"])
-            distance = query_hash - item_hash
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_match = item
+            for phash_hex in item_phashes(item):
+                distance = query_hash - imagehash.hex_to_hash(phash_hex)
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_match = item
 
         if best_match and best_distance <= IMAGE_MATCH_THRESHOLD:
             await send_product_detail(context.bot, chat_id, best_match)
         else:
-            await update.message.reply_text("לא הצלחתי למצוא התאמה מספיק טובה לתמונה הזו 🤔")
+            await context.bot.send_message(chat_id=chat_id, text="לא הצלחתי למצוא התאמה מספיק טובה לתמונה הזו 🤔")
             await notify_admin_group_photo(
-                context, photo.file_id, f"🔎 חיפוש לפי תמונה ללא תוצאה\nמאת: {describe_user(update)}"
+                context, first_file_id, f"🔎 חיפוש לפי תמונה ללא תוצאה\nמאת: {mention_html}"
             )
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+async def process_media_group_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """נקרא אחרי דיליי קצר מאז התמונה האחרונה של אלבום - מעבד את כל האלבום ביחד."""
+    media_group_id = context.job.data
+    buf = MEDIA_GROUP_BUFFERS.pop(media_group_id, None)
+    if not buf:
+        return
+    await route_incoming_photos(
+        context, buf["chat_id"], buf["user_id"], buf["caption"], buf["file_ids"], buf["mention_html"]
+    )
+
+
+async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """מטפל בתמונה נכנסת. אם היא חלק מאלבום (media_group_id), אוספים אותה
+    במאגר זמני וממתינים רגע לשאר התמונות של אותו אלבום לפני עיבוד; אחרת
+    מעבדים מיד (ראה route_incoming_photos לניתוב בפועל)."""
+    message = update.message
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    caption = message.caption or ""
+    file_id = message.photo[-1].file_id
+    mention_html = user_mention_html(update)
+
+    media_group_id = message.media_group_id
+    if media_group_id:
+        buf = MEDIA_GROUP_BUFFERS.setdefault(
+            media_group_id,
+            {"file_ids": [], "caption": "", "chat_id": chat_id, "user_id": user_id, "mention_html": mention_html},
+        )
+        buf["file_ids"].append(file_id)
+        if caption:
+            buf["caption"] = caption
+
+        # דוחים (debounce) את העיבוד בכל פעם שמגיעה עוד תמונה מאותו אלבום,
+        # כדי לוודא שכל התמונות נאספו לפני שממשיכים.
+        if context.job_queue is not None:
+            for job in context.job_queue.get_jobs_by_name(media_group_id):
+                job.schedule_removal()
+            context.job_queue.run_once(
+                process_media_group_job, when=MEDIA_GROUP_DEBOUNCE_SECONDS, data=media_group_id, name=media_group_id
+            )
+        else:
+            # גיבוי נדיר: אם JobQueue לא זמין (חסרה תלות apscheduler) - מעבדים
+            # מיד את מה שיש עד כה במקום לא להגיב בכלל.
+            logger.warning("JobQueue not available - processing media group immediately without debounce")
+            await route_incoming_photos(context, chat_id, user_id, buf["caption"], buf["file_ids"], mention_html)
+            MEDIA_GROUP_BUFFERS.pop(media_group_id, None)
+        return
+
+    await route_incoming_photos(context, chat_id, user_id, caption, [file_id], mention_html)
 
 
 # ---------------------------------------------------------------------------
@@ -694,8 +833,8 @@ async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     removed = next(item for item in catalog if item["id"] == product_id)
-    image_path = DATA_DIR / removed["image_path"]
-    image_path.unlink(missing_ok=True)
+    for path in item_image_paths(removed):
+        (DATA_DIR / path).unlink(missing_ok=True)
 
     save_catalog(new_catalog)
     await update.message.reply_text(f"🗑️ נמחק מוצר {product_id}")

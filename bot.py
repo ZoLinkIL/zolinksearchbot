@@ -246,7 +246,7 @@ def build_grid_image(items: list[dict]) -> io.BytesIO:
     draw = ImageDraw.Draw(canvas)
 
     try:
-        font = ImageFont.truetype(str(FONT_PATH), 34) if FONT_PATH.exists() else ImageFont.load_default()
+        font = ImageFont.truetype(str(FONT_PATH), 56) if FONT_PATH.exists() else ImageFont.load_default()
     except Exception:
         font = ImageFont.load_default()
 
@@ -263,8 +263,8 @@ def build_grid_image(items: list[dict]) -> io.BytesIO:
             draw.rectangle([x0, y0, x0 + GRID_CELL_PX, y0 + GRID_CELL_PX], fill=(230, 230, 230))
 
         # תגית מספר אדומה בפינה השמאלית-עליונה של כל תא
-        cx, cy, r = x0 + 32, y0 + 32, 26
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(214, 39, 55), outline="white", width=3)
+        cx, cy, r = x0 + 44, y0 + 44, 40
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(214, 39, 55), outline="white", width=5)
         text = str(idx + 1)
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -310,7 +310,10 @@ async def send_grid_page(context: ContextTypes.DEFAULT_TYPE, chat_id: int, sessi
     await context.bot.send_photo(
         chat_id=chat_id,
         photo=image_buffer,
-        caption="הכי קרוב שמצאתי 👇\nלחצו על המספר כדי לקבל את הפרטים והקישור 👇",
+        caption=(
+            "🔍 מצאתי כמה דגמים שמתאימים!\n"
+            "בחרו את המספר של הדגם שאהבתם ונשלח לכם את כל הפרטים + קישור ההזמנה 👇"
+        ),
         reply_markup=InlineKeyboardMarkup(keyboard_rows),
     )
 

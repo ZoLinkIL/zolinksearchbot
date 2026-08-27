@@ -17,6 +17,7 @@ pip install -r requirements.txt
 export BOT_TOKEN="הטוקן_שקיבלת_מ-BotFather"
 export ADMIN_IDS="123456789"   # ה-ID שלך, אפשר כמה מופרדים בפסיק
 export CATALOG_GROUP_ID="-1001234567890"   # אופציונלי - רק אם יש קבוצת העלאה נפרדת
+export CATALOG_DIR="."   # אופציונלי - איפה לשמור את הקטלוג (ראה "אחסון קבוע" למטה)
 python bot.py
 ```
 
@@ -81,13 +82,26 @@ python bot.py
    - `BOT_TOKEN` = הטוקן שלך
    - `ADMIN_IDS` = ה-ID שלך
    - `CATALOG_GROUP_ID` = מזהה קבוצת ההעלאה (אופציונלי — רק אם הגדרת קבוצה נפרדת, שלב 3ב׳ למעלה)
+   - `CATALOG_DIR` = `/data` (**חשוב מאוד** — בלי זה, כל Redeploy ימחק את הקטלוג! ראה "אחסון קבוע" למטה)
 4. Railway יריץ אוטומטית `python bot.py` (וודא ש-Start Command מוגדר כך, או הוסף `Procfile` עם `worker: python bot.py`).
 
 ### Render
 
-דומה ל-Railway: "New Background Worker" → מחברים ל-GitHub repo → מגדירים משתני סביבה `BOT_TOKEN` ו-`ADMIN_IDS` → Build Command: `pip install -r requirements.txt` → Start Command: `python bot.py`.
+דומה ל-Railway: "New Background Worker" → מחברים ל-GitHub repo → מגדירים משתני סביבה `BOT_TOKEN`, `ADMIN_IDS` ו-`CATALOG_DIR` → Build Command: `pip install -r requirements.txt` → Start Command: `python bot.py`. ב-Render התיקייה הקבועה נוצרת תחת "Disks" (במקום "Volumes").
 
-**חשוב:** בשתי האפשרויות, קובצי הקטלוג (`catalog.json` + `catalog_images/`) נשמרים על הדיסק של השרת. אם השרת מתאפס (redeploy), הם עלולים להימחק — אם זה קריטי, כדאי בהמשך לעבור לאחסון קבוע כמו S3 או מסד נתונים חיצוני. לכמות מוצרים סבירה (עשרות-מאות) זה לא דחוף.
+## אחסון קבוע — קריטי!
+
+כברירת מחדל, קבצי הקטלוג (`catalog.json` + `catalog_images/`) נשמרים
+על הדיסק **הזמני** של השרת. ב-Railway/Render, הדיסק הזה מתאפס בכל
+**Redeploy** — כלומר כל מוצר שהוספת ייעלם.
+
+כדי למנוע את זה, צריך דיסק **קבוע** (Volume):
+
+1. ב-Railway: לך לשירות שמריץ את `bot.py` → Settings → Volumes → New Volume. תן לו Mount Path קבוע, למשל `/data`.
+2. הוסף משתנה סביבה `CATALOG_DIR=/data` (ראה שלב 5 למעלה) — הבוט כבר תומך בזה, הוא ישמור וישחזר את הקטלוג מהתיקייה הזו במקום מהתיקייה הזמנית של הקוד.
+3. עשה Redeploy אחד אחרון. מרגע זה, מוצרים שתוסיף יישרדו כל Redeploy עתידי.
+
+בלי `CATALOG_DIR` מוגדר, הבוט ימשיך לעבוד אבל יאבד את הקטלוג בכל דיפלוי חדש — לכמות בדיקות קטנה זה בסדר, אבל לשימוש אמיתי חובה להגדיר Volume.
 
 ## התאמה אישית לרשת הדפדוף
 

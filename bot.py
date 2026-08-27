@@ -17,16 +17,20 @@
 - כל משתמש אחר (בצ'אט פרטי או בקבוצה אחרת, לא קבוצת ההעלאה) יכול:
     - לכתוב "חפש לי <מותג>" -> אם יש תוצאה אחת, מקבל תמונה+פרטים מלאים.
       אם יש כמה תוצאות, מקבל רשת תמונות ממוספרת עם כפתורים לבחירה.
+      אם אין תוצאות, נשלחת התראה לקבוצת האדמין (NOTIFY_GROUP_ID) עם מה שחיפש.
     - לכתוב "קטלוג" (או /catalog) -> רשת דפדוף על כל המוצרים בקטלוג.
-    - לשלוח תמונה -> הבוט מחשב טביעת אצבע ויזואלית (perceptual hash)
-      ומשווה לתמונות השמורות, ומחזיר את ההתאמה הכי קרובה (עם תמונה) אם יש כזו.
+    - לשלוח תמונה -> אם ENABLE_IMAGE_SEARCH=false (ברירת מחדל: true), הבוט לא
+      מנסה להתאים בכלל - מודיע למשתמש ומעביר את התמונה לקבוצת האדמין.
+      אם מופעל, הבוט מחשב טביעת אצבע ויזואלית (perceptual hash) ומשווה
+      לתמונות השמורות; אם לא נמצאה התאמה, גם זה נשלח לקבוצת האדמין.
 
 - /list -> אדמין בלבד: מציג את כל המוצרים בקטלוג (מזהה, מותג, מחיר, קישור).
 - /edit <id> -> אדמין בלבד: מתחיל עריכת מוצר קיים - שולחים תמונה+כיתוב חדשים
   (כמו בהוספה) והם מחליפים את הישן. שדה שמשאירים ריק/לא כתוב נשאר כמו שהיה.
 - /canceledit -> מבטל עריכה שהתחילה עם /edit.
 - /delete <id> -> אדמין בלבד: מוחק מוצר מהקטלוג.
-- /groupid -> מציג את מזהה הקבוצה הנוכחית (שימושי כדי להגדיר CATALOG_GROUP_ID).
+- /groupid -> מציג את מזהה הקבוצה הנוכחית (שימושי כדי להגדיר CATALOG_GROUP_ID
+  או NOTIFY_GROUP_ID).
 
 הערה לגבי אמינות: כל שגיאה בלתי צפויה נתפסת ע"י error handler גלובלי -
 המשתמש תמיד יקבל הודעה שמשהו השתבש (במקום שקט מוחלט), והשגיאה המלאה
@@ -80,6 +84,21 @@ ADMIN_IDS = {
 _catalog_group_raw = os.environ.get("CATALOG_GROUP_ID", "").strip()
 CATALOG_GROUP_ID = int(_catalog_group_raw) if _catalog_group_raw else None
 
+# קבוצת התראות לאדמין (אופציונלי) - כשמישהו מחפש ולא נמצאה התאמה (טקסט או
+# תמונה), נשלחת לכאן הודעה עם פרטי המשתמש ומה שהוא חיפש/שלח, כדי שתוכל
+# לפנות אליו ישירות. השאר ריק כדי לכבות את זה.
+_notify_group_raw = os.environ.get("NOTIFY_GROUP_ID", "").strip()
+NOTIFY_GROUP_ID = int(_notify_group_raw) if _notify_group_raw else None
+
+# האם חיפוש לפי תמונה פעיל. כשזה False, שליחת תמונה (שאינה חלק מהוספה/עריכה
+# ע"י אדמין) לא מנסה להתאים בקטלוג בכלל - היא רק מודיעה למשתמש ומעבירה
+# את הפנייה לקבוצת ההתראות (NOTIFY_GROUP_ID) לטיפול ידני.
+ENABLE_IMAGE_SEARCH = os.environ.get("ENABLE_IMAGE_SEARCH", "true").strip().lower() not in (
+    "false",
+    "0",
+    "no",
+)
+
 # סף דמיון לתמונות. ככל שההפרש (hamming distance) קטן יותר - התמונות דומות יותר.
 # 0 = זהה לגמרי, המקסימום התיאורטי הוא 64. הועלה מ-10 ל-16 (27/08) כדי לתת
 # יותר סבלנות לזוויות/תאורה/רקע שונים - אם מתחילות להופיע התאמות שגויות
@@ -115,6 +134,36 @@ PENDING_EDITS: dict[int, str] = {}
 # תוצאות חיפוש/דפדוף פעילות (בזיכרון): session_id -> רשימת מזהי מוצרים,
 # כדי שכפתורי הבחירה/הדפדוף (callback_data) יישארו קצרים.
 SEARCH_SESSIONS: dict[str, list[str]] = {}
+
+
+def describe_user(update: Update) -> str:
+    """מחרוזת קצרה לזיהוי מי שלח את הפנייה, לשימוש בהתראות לאדמין."""
+    user = update.effective_user
+    name = user.full_name or "משתמש"
+    handle = f"@{user.username}" if user.username else f"id:{user.id}"
+    return f"{name} ({handle})"
+
+
+async def notify_admin_group(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """שולח הודעת התראה לקבוצת האדמין, אם היא מוגדרת (NOTIFY_GROUP_ID)."""
+    if NOTIFY_GROUP_ID is None:
+        return
+    try:
+        await context.bot.send_message(chat_id=NOTIFY_GROUP_ID, text=text, disable_web_page_preview=True)
+    except Exception:
+        logger.exception("Failed to send admin notification")
+
+
+async def notify_admin_group_photo(
+    context: ContextTypes.DEFAULT_TYPE, file_id: str, caption: str
+) -> None:
+    """מעביר תמונה שהתקבלה לחיפוש (בלי שנמצאה התאמה/כשזיהוי תמונות כבוי) לקבוצת האדמין."""
+    if NOTIFY_GROUP_ID is None:
+        return
+    try:
+        await context.bot.send_photo(chat_id=NOTIFY_GROUP_ID, photo=file_id, caption=caption)
+    except Exception:
+        logger.exception("Failed to send admin photo notification")
 
 
 def load_catalog() -> list[dict]:
@@ -452,6 +501,9 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not results:
         await update.message.reply_text(f'לא מצאתי מוצר שמתאים ל"{query}" 🤷')
+        await notify_admin_group(
+            context, f"🔎 חיפוש ללא תוצאה\nמאת: {describe_user(update)}\nחיפש: \"{query}\""
+        )
         return
 
     await start_browse(update, context, results)
@@ -502,13 +554,28 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_add_product(update, context)
         return
 
-    # 3. כל מקרה אחר -> חיפוש לפי התמונה
+    # 3. חיפוש לפי תמונה - אם כבוי (ENABLE_IMAGE_SEARCH=false), לא מנסים להתאים
+    # בכלל: מודיעים למשתמש ומעבירים את התמונה לקבוצת האדמין לטיפול ידני.
+    photo = update.message.photo[-1]
+
+    if not ENABLE_IMAGE_SEARCH:
+        await update.message.reply_text(
+            "🔍 חיפוש לפי תמונה כרגע לא זמין.\n"
+            'תכתבו לי מה אתם מחפשים (למשל "חפש לי נייקי") ואשמח לעזור - '
+            "או שנחזור אליכם ישירות בקרוב 🙏"
+        )
+        await notify_admin_group_photo(
+            context,
+            photo.file_id,
+            f"📸 בקשת חיפוש לפי תמונה (זיהוי תמונות כבוי)\nמאת: {describe_user(update)}",
+        )
+        return
+
     catalog = load_catalog()
     if not catalog:
         await update.message.reply_text("הקטלוג עדיין ריק, אין מה לחפש בו כרגע.")
         return
 
-    photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
 
     tmp_path = IMAGES_DIR / f"_search_{uuid.uuid4().hex[:8]}.jpg"
@@ -530,6 +597,9 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_product_detail(context.bot, chat_id, best_match)
         else:
             await update.message.reply_text("לא הצלחתי למצוא התאמה מספיק טובה לתמונה הזו 🤔")
+            await notify_admin_group_photo(
+                context, photo.file_id, f"🔎 חיפוש לפי תמונה ללא תוצאה\nמאת: {describe_user(update)}"
+            )
     finally:
         tmp_path.unlink(missing_ok=True)
 

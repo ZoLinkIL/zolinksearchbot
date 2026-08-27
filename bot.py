@@ -269,6 +269,13 @@ ADD_FORMAT_HELP = (
     'לחיפוש - תכתוב "חפש לי <מותג>", "קטלוג" לדפדוף בהכל, או שלח תמונה.'
 )
 
+# הודעה שמוצגת כשחיפוש (טקסט מפורש או תמונה) לא הניב תוצאה - זמנית, כל עוד
+# הקטלוג עדיין קטן/בבנייה. אפשר לשנות את הניסוח כאן במקום אחד.
+NOT_FOUND_MESSAGE = (
+    "🛠️ הבוט עדיין בבנייה ומרחיב את הקטלוג כל הזמן - עדיין לא מצאנו את מה שחיפשת.\n"
+    "נחזור אליך בפרטי בהקדם עם מה שביקשת! 🙏"
+)
+
 
 # ---------------------------------------------------------------------------
 # בניית הודעת/תמונת תוצאה למוצר בודד
@@ -590,7 +597,7 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
         query = explicit_match.group(1).strip().lower()
         results = [item for item in catalog if query in item.get("brand", "").lower()]
         if not results:
-            await update.message.reply_text(f'לא מצאתי מוצר שמתאים ל"{query}" 🤷')
+            await update.message.reply_text(NOT_FOUND_MESSAGE)
             await notify_admin_group(
                 context,
                 f"🔎 חיפוש ללא תוצאה\nמאת: {user_mention_html(update)}\nחיפש: \"{html.escape(query)}\"",
@@ -703,7 +710,7 @@ async def route_incoming_photos(
         if best_match and best_distance <= IMAGE_MATCH_THRESHOLD:
             await send_product_detail(context.bot, chat_id, best_match)
         else:
-            await context.bot.send_message(chat_id=chat_id, text="לא הצלחתי למצוא התאמה מספיק טובה לתמונה הזו 🤔")
+            await context.bot.send_message(chat_id=chat_id, text=NOT_FOUND_MESSAGE)
             await notify_admin_group_photo(
                 context, first_file_id, f"🔎 חיפוש לפי תמונה ללא תוצאה\nמאת: {mention_html}"
             )

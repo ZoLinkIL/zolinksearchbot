@@ -21,11 +21,12 @@
   (MEDIA_GROUP_DEBOUNCE_SECONDS) לפני שהוא שומר את המוצר.
 
 - כל משתמש אחר (בצ'אט פרטי או בקבוצה אחרת, לא קבוצת ההעלאה) יכול:
-    - לכתוב "חפש לי <מותג>" -> חיפוש מפורש. אם יש תוצאה אחת, מקבל תמונה+פרטים
+    - לכתוב "חפש לי <מותג>" -> חיפוש מטושטש (fuzzy) שסובלני לטעויות הקלדה
+      קטנות (אות חסרה/עודפת/מוחלפת). אם יש תוצאה אחת, מקבל תמונה+פרטים
       מלאים. אם יש כמה, מקבל רשת ממוספרת. בלי תוצאה - "לא מצאתי" + התראה לאדמין.
-    - לכתוב שם מותג ישירות, בלי "חפש לי" (למשל סתם "נייקי") -> אותו חיפוש,
-      אבל אם אין התאמה הבוט שותק (כדי לא להגיב "לא מצאתי" על כל הודעת צ'אט
-      סתמית). ההתנהגות הזו כבויה בקבוצת ההעלאה עצמה.
+    - לכתוב שם מותג ישירות, בלי "חפש לי" (עד 3 מילים, למשל סתם "נייקי") ->
+      אותו חיפוש מטושטש, אבל אם אין התאמה הבוט שותק (כדי לא להגיב "לא
+      מצאתי" על כל הודעת צ'אט סתמית). כבוי בקבוצת ההעלאה עצמה.
     - לכתוב "קטלוג" (או /catalog) -> רשת דפדוף על כל המוצרים בקטלוג.
     - לשלוח תמונה -> אם ENABLE_IMAGE_SEARCH=false (ברירת מחדל: true), הבוט לא
       מנסה להתאים בכלל - מודיע למשתמש ומעביר את התמונה לקבוצת האדמין.
@@ -56,6 +57,7 @@ from pathlib import Path
 
 import imagehash
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from rapidfuzz import fuzz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -188,6 +190,33 @@ async def notify_admin_group_photo(
         )
     except Exception:
         logger.exception("Failed to send admin photo notification")
+
+
+# סף התאמה מטושטשת לחיפוש טקסט (0-100, ככל שגבוה יותר - דורש התאמה מדויקת
+# יותר). 80 סובלני לטעויות הקלדה קלות (אות חסרה/עודפת) בלי לתפוס מילים
+# מקריות מהודעות צ'אט סתמיות. אם מתחילות להופיע התאמות שגויות, העלה את
+# המספר; אם חיפושים סבירים לא נמצאים, הורד אותו מעט.
+FUZZY_MATCH_THRESHOLD = 80
+
+
+def search_catalog(query: str, catalog: list[dict]) -> list[dict]:
+    """חיפוש מטושטש (fuzzy) של query מול שם המותג של כל מוצר - סובלני לטעויות
+    הקלדה קטנות. מחזיר את המוצרים התואמים, מהניקוד הגבוה לנמוך."""
+    query = (query or "").strip().lower()
+    if not query:
+        return []
+
+    scored: list[tuple[float, dict]] = []
+    for item in catalog:
+        brand = (item.get("brand") or "").strip().lower()
+        if not brand:
+            continue
+        score = max(fuzz.partial_ratio(query, brand), fuzz.token_sort_ratio(query, brand))
+        if score >= FUZZY_MATCH_THRESHOLD:
+            scored.append((score, item))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 def item_image_paths(item: dict) -> list[str]:
@@ -594,8 +623,8 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     explicit_match = re.match(r"^\s*חפש\s*לי\s+(.+)", text)
     if explicit_match:
-        query = explicit_match.group(1).strip().lower()
-        results = [item for item in catalog if query in item.get("brand", "").lower()]
+        query = explicit_match.group(1).strip()
+        results = search_catalog(query, catalog)
         if not results:
             await update.message.reply_text(NOT_FOUND_MESSAGE)
             await notify_admin_group(
@@ -611,8 +640,11 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if is_catalog_group(update.effective_chat.id):
         return
 
-    query = text.strip().lower()
-    results = [item for item in catalog if query in item.get("brand", "").lower()]
+    # רק לטקסט קצר (עד 3 מילים) - משפטים ארוכים כנראה שיחה רגילה, לא שם מוצר.
+    if len(text.split()) > 3:
+        return
+
+    results = search_catalog(text, catalog)
     if results:
         await start_browse(update, context, results)
     # אין תוצאה -> שקט בכוונה (ראה docstring למעלה)

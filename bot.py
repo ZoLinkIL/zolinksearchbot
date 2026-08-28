@@ -297,7 +297,7 @@ def format_product_header(item: dict) -> str:
 
     lines.append("")
     link = html.escape(item["link"], quote=True)
-    lines.append(f'🔗 קישור מוסתר - <a href="{link}">לחצו כאן להזמנה</a>')
+    lines.append(f"🔗 לקישור המוסתר:\n{link}")
 
     return "\n".join(lines)
 

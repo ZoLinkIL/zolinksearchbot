@@ -44,6 +44,9 @@
 - /delete <id> -> אדמין בלבד: מוחק מוצר מהקטלוג.
 - /groupid -> מציג את מזהה הקבוצה הנוכחית (שימושי כדי להגדיר CATALOG_GROUP_ID
   או NOTIFY_GROUP_ID).
+- שליחת קובץ .zip מאדמין בצ'אט פרטי (או בקבוצת ההעלאה) -> ייבוא מרובה של
+  מוצרים מ-products.json + תיקיית images/ (ראה README, סעיף ייבוא ZIP).
+  אופציונלי לצרף כיתוב /import; כל קובץ ZIP מאדמין עובד. מגבלת טלגרם: עד 20MB.
 
 הערה לגבי אמינות: כל שגיאה בלתי צפויה נתפסת ע"י error handler גלובלי -
 המשתמש תמיד יקבל הודעה שמשהו השתבש (במקום שקט מוחלט), והשגיאה המלאה
@@ -57,6 +60,7 @@ import logging
 import os
 import re
 import uuid
+import zipfile
 from pathlib import Path
 
 import imagehash
@@ -653,6 +657,243 @@ async def apply_edit(
 
 
 # ---------------------------------------------------------------------------
+# ייבוא מרובה מקובץ ZIP
+# ---------------------------------------------------------------------------
+
+# מגבלת גודל לא-דחוס כוללת לתוכן ה-ZIP (הגנה מפני zip-bomb).
+MAX_ZIP_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+# מגבלת הורדה של טלגרם לקבצים דרך הבוט.
+TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+
+def _is_safe_zip_member(name: str) -> bool:
+    """ודא שנתיב בתוך ה-ZIP לא בורח מהתיקייה (zip-slip): בלי absolute / .. """
+    if not name or name.endswith("/"):
+        return False
+    # נרמול ל־/ גם אם נוצר ב־Windows
+    norm = name.replace("\\", "/")
+    if norm.startswith("/") or norm.startswith("../") or "/../" in f"/{norm}/":
+        return False
+    parts = Path(norm).parts
+    if any(p == ".." or p.startswith("..") for p in parts):
+        return False
+    if Path(norm).is_absolute():
+        return False
+    return True
+
+
+def import_zip_into_catalog(zip_path) -> dict:
+    """מייבא מוצרים מקובץ ZIP בפורמט: products.json בשורש + תיקיית images/.
+
+    כל אובייקט ב-products.json: source_id, brand, details, price, link, images
+    (נתיבים יחסיים בתוך ה-ZIP, בסדר תצוגה). אם כבר קיים מוצר עם אותו
+    source_id — מעדכנים אותו (בלי כפילות); אחרת יוצרים מזהה קצר חדש.
+
+    מחזיר dict: {added, updated, skipped: [{source_id, reason}, ...]}
+    פונקציה סינכרונית טהורה (בלי טלגרם) — נוחה לבדיקות offline.
+    """
+    zip_path = Path(zip_path)
+    summary: dict = {"added": 0, "updated": 0, "skipped": []}
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        infos = zf.infolist()
+        total_uncompressed = sum(info.file_size for info in infos)
+        if total_uncompressed > MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"ה-ZIP גדול מדי אחרי חילוץ "
+                f"({total_uncompressed // (1024 * 1024)}MB, מקסימום "
+                f"{MAX_ZIP_UNCOMPRESSED_BYTES // (1024 * 1024)}MB)"
+            )
+
+        # מפתחות שמות בנרמול ל־/
+        name_map = {info.filename.replace("\\", "/"): info.filename for info in infos}
+        if "products.json" not in name_map:
+            raise ValueError("חסר products.json בשורש קובץ ה-ZIP")
+
+        raw = zf.read(name_map["products.json"])
+        try:
+            products = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"products.json לא תקין: {exc}") from exc
+        if not isinstance(products, list):
+            raise ValueError("products.json חייב להכיל רשימה (list) של מוצרים")
+
+        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        catalog = load_catalog()
+
+        for entry in products:
+            if not isinstance(entry, dict):
+                summary["skipped"].append({"source_id": "", "reason": "רשומה לא תקינה (לא אובייקט)"})
+                continue
+
+            source_id = str(entry.get("source_id") or "").strip()
+            link = str(entry.get("link") or "").strip()
+            images = entry.get("images") or []
+            if not isinstance(images, list):
+                images = []
+
+            if not link:
+                summary["skipped"].append({"source_id": source_id, "reason": "חסר קישור (link)"})
+                continue
+            if not images:
+                summary["skipped"].append({"source_id": source_id, "reason": "חסרות תמונות (images)"})
+                continue
+
+            # בדיקת נתיבי תמונות לפני כתיבה
+            resolved_members: list[str] = []
+            bad_image = False
+            for rel in images:
+                rel_s = str(rel).replace("\\", "/")
+                while rel_s.startswith("./"):
+                    rel_s = rel_s[2:]
+                if not _is_safe_zip_member(rel_s):
+                    summary["skipped"].append(
+                        {"source_id": source_id, "reason": f"נתיב תמונה לא בטוח: {rel}"}
+                    )
+                    bad_image = True
+                    break
+                if rel_s not in name_map:
+                    summary["skipped"].append(
+                        {"source_id": source_id, "reason": f"תמונה חסרה ב-ZIP: {rel_s}"}
+                    )
+                    bad_image = True
+                    break
+                resolved_members.append(name_map[rel_s])
+            if bad_image:
+                continue
+
+            existing_idx = next(
+                (i for i, p in enumerate(catalog) if source_id and p.get("source_id") == source_id),
+                None,
+            )
+            if existing_idx is not None:
+                product_id = catalog[existing_idx]["id"]
+                for old_path in item_image_paths(catalog[existing_idx]):
+                    (DATA_DIR / old_path).unlink(missing_ok=True)
+                is_update = True
+            else:
+                product_id = str(uuid.uuid4())[:8]
+                is_update = False
+
+            image_paths: list[str] = []
+            phashes: list[str] = []
+            try:
+                for idx, member_name in enumerate(resolved_members):
+                    data = zf.read(member_name)
+                    with Image.open(io.BytesIO(data)) as im:
+                        rgb = im.convert("RGB")
+                        out_path = IMAGES_DIR / f"{product_id}_{idx}.jpg"
+                        rgb.save(out_path, "JPEG", quality=92)
+                    image_paths.append(str(out_path.relative_to(DATA_DIR)))
+                    phashes.append(str(imagehash.phash(Image.open(out_path))))
+            except Exception as exc:
+                # ניקוי חלקי אם נכשל באמצע
+                for p in image_paths:
+                    (DATA_DIR / p).unlink(missing_ok=True)
+                summary["skipped"].append(
+                    {"source_id": source_id, "reason": f"שגיאה בפתיחת/שמירת תמונה: {exc}"}
+                )
+                continue
+
+            brand = str(entry.get("brand") or "").strip()
+            details = entry.get("details") or []
+            if not isinstance(details, list):
+                details = [str(details)] if details else []
+            details = [str(d).strip() for d in details if str(d).strip()]
+            price = str(entry.get("price") or "").strip()
+
+            item = {
+                "id": product_id,
+                "source_id": source_id,
+                "brand": brand,
+                "details": details,
+                "price": price,
+                "link": link,
+                "image_paths": image_paths,
+                "phashes": phashes,
+                "video_file_ids": [],
+            }
+            # ניקוי שדות ישנים אם היו
+            if existing_idx is not None:
+                item.pop("image_path", None)
+                catalog[existing_idx] = item
+                # גם אם נשארו מפתחות ישנים — דורסים את הרשומה
+                summary["updated"] += 1
+            else:
+                catalog.append(item)
+                summary["added"] += 1
+
+        save_catalog(catalog)
+
+    return summary
+
+
+def format_import_summary(summary: dict) -> str:
+    """בונה הודעת סיכום בעברית לייבוא ZIP."""
+    lines = [
+        "📦 ייבוא ZIP הסתיים",
+        f"✅ נוספו: {summary.get('added', 0)}",
+        f"✏️ עודכנו: {summary.get('updated', 0)}",
+    ]
+    skipped = summary.get("skipped") or []
+    lines.append(f"⏭️ דולגו: {len(skipped)}")
+    for s in skipped[:20]:
+        sid = s.get("source_id") or "—"
+        reason = s.get("reason") or "—"
+        lines.append(f"  • {sid}: {reason}")
+    if len(skipped) > 20:
+        lines.append(f"  … ועוד {len(skipped) - 20}")
+    lines.append("")
+    lines.append(
+        f"⚠️ שימו לב: טלגרם מאפשר הורדת קבצים לבוט עד "
+        f"{TELEGRAM_MAX_DOWNLOAD_BYTES // (1024 * 1024)}MB בלבד. "
+        "אם ה-ZIP גדול יותר — פצלו אותו (למשל עם make_package.py)."
+    )
+    return "\n".join(lines)
+
+
+async def handle_zip_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ייבוא מרובה מקובץ ZIP: אדמין בצ'אט פרטי, או כל שליחה בקבוצת ההעלאה.
+    כיתוב /import אופציונלי — כל מסמך .zip מורשה עובר ייבוא."""
+    message = update.message
+    if not message or not message.document:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    in_private_admin = chat.type == "private" and is_admin(user.id)
+    in_catalog_group = is_catalog_group(chat.id)
+    if not (in_private_admin or in_catalog_group):
+        return
+
+    doc = message.document
+    if doc.file_size and doc.file_size > TELEGRAM_MAX_DOWNLOAD_BYTES:
+        await message.reply_text(
+            f"הקובץ גדול מדי ({doc.file_size // (1024 * 1024)}MB). "
+            f"טלגרם מאפשר לבוט להוריד עד {TELEGRAM_MAX_DOWNLOAD_BYTES // (1024 * 1024)}MB בלבד — "
+            "פצלו את ה-ZIP לקבצים קטנים יותר ושלחו שוב."
+        )
+        return
+
+    status_msg = await message.reply_text("📦 קולט את קובץ ה-ZIP ומייבא מוצרים...")
+    tmp_path = IMAGES_DIR / f"_import_{uuid.uuid4().hex[:8]}.zip"
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(str(tmp_path))
+        summary = import_zip_into_catalog(tmp_path)
+        await status_msg.edit_text(format_import_summary(summary))
+    except ValueError as exc:
+        await status_msg.edit_text(f"❌ הייבוא נכשל: {exc}")
+    except Exception:
+        logger.exception("ZIP import failed")
+        await status_msg.edit_text(
+            "❌ הייבוא נכשל בגלל תקלה לא צפויה. בדקו את הלוגים / את מבנה ה-ZIP."
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # חיפוש (טקסט/תמונה) ודפדוף בקטלוג
 # ---------------------------------------------------------------------------
 
@@ -1018,6 +1259,7 @@ def main() -> None:
     app.add_handler(CommandHandler("delete", handle_delete))
     app.add_handler(CommandHandler("groupid", handle_groupid))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media_message))
+    app.add_handler(MessageHandler(filters.Document.ZIP, handle_zip_import))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_search))
     app.add_handler(CallbackQueryHandler(handle_grid_callback))
     app.add_error_handler(handle_error)

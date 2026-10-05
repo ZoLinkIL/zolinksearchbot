@@ -24,7 +24,9 @@
 
 - כל משתמש אחר (בצ'אט פרטי או בקבוצה אחרת, לא קבוצת ההעלאה) יכול:
     - לכתוב "חפש לי <מותג>" -> חיפוש מטושטש (fuzzy) שסובלני לטעויות הקלדה
-      קטנות (אות חסרה/עודפת/מוחלפת). אם יש תוצאה אחת, מקבל מדיה+פרטים
+      קטנות (אות חסרה/עודפת/מוחלפת), עם נרמול עברית: נעלי/נעליים = נעל, אותיות
+      סופיות, כתיב מלא/חסר (פרדה = פראדה) וכינויי מותגים (ניקי = נייקי). כל מילה
+      בשאילתה צריכה להתאים לכותרת. אם יש תוצאה אחת, מקבל מדיה+פרטים
       מלאים. אם יש כמה, מקבל רשת ממוספרת. בלי תוצאה - "לא מצאתי" + התראה לאדמין.
     - לכתוב שם מותג ישירות, בלי "חפש לי" (עד 3 מילים, למשל סתם "נייקי") ->
       אותו חיפוש מטושטש, אבל אם אין התאמה הבוט שותק (כדי לא להגיב "לא
@@ -38,6 +40,7 @@
       הבוט מודיע ומעביר את הפנייה לקבוצת האדמין.
 
 - /list -> אדמין בלבד: מציג את כל המוצרים בקטלוג (מזהה, מותג, מחיר, קישור).
+- /stats -> אדמין בלבד: סה"כ מוצרים, פילוח לפי מותג ולפי סוג (category), ו-20 האחרונים שנוספו.
 - /edit <id> -> אדמין בלבד: מתחיל עריכת מוצר קיים - שולחים תמונה/סרטון+כיתוב
   חדשים (כמו בהוספה) והם מחליפים את הישן. שדה שמשאירים ריק/לא כתוב נשאר כמו שהיה.
 - /canceledit -> מבטל עריכה שהתחילה עם /edit.
@@ -61,6 +64,7 @@ import os
 import re
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import imagehash
@@ -200,31 +204,240 @@ async def notify_admin_group_photo(
         logger.exception("Failed to send admin photo notification")
 
 
-# סף התאמה מטושטשת לחיפוש טקסט (0-100, ככל שגבוה יותר - דורש התאמה מדויקת
-# יותר). 80 סובלני לטעויות הקלדה קלות (אות חסרה/עודפת) בלי לתפוס מילים
-# מקריות מהודעות צ'אט סתמיות. אם מתחילות להופיע התאמות שגויות, העלה את
-# המספר; אם חיפושים סבירים לא נמצאים, הורד אותו מעט.
+# סף התאמה לחיפוש טקסט (0-100). כל מילה בשאילתה צריכה להתאים למילה בכותרת המוצר
+# בציון הזה לפחות (אחרי נרמול עברית - ראה normalize_search_text). 80 סובלני לטעויות
+# הקלדה קלות (אות חסרה/עודפת) בלי לתפוס מילים מקריות מהודעות צ'אט סתמיות.
 FUZZY_MATCH_THRESHOLD = 80
+
+# ---------------------------------------------------------------------------
+# נרמול עברית לחיפוש (בזמן חיפוש - חל גם על כותרות שכבר בקטלוג):
+#  - אותיות סופיות (ך ם ן ף ץ -> כ מ נ פ צ), ניקוד, גרש/גרשיים (ג'ורדן = גורדן)
+#  - נטיות של מילות סוג: נעלי/נעליים -> נעל, שעוני/שעונים -> שעון, כפכפים -> כפכף ...
+#  - כתיב מלא/חסר: השוואה גם בלי אמות קריאה א/ו/י (פרדה = פראדה)
+#  - טבלת כינויים למותגים נפוצים (נייקי/ניקי, אדידס/אדידאס, ניו בלנס/ניו באלאנס ...)
+# ---------------------------------------------------------------------------
+
+_FINALS = str.maketrans("ךםןףץ", "כמנפצ")
+_NIQQUD_RE = re.compile(r"[\u0591-\u05C7]")
+_GERESH_RE = re.compile(r"[\u05F3\u05F4'`\u2018\u2019\"\u201C\u201D]")
+_TOKEN_SPLIT_RE = re.compile(r"[^0-9a-z\u05D0-\u05EA]+")
+_HE_DIGIT_BOUNDARY_RE = re.compile(r"(?<=[\u05D0-\u05EA])(?=\d)|(?<=\d)(?=[\u05D0-\u05EA])")
+
+# גזעי מילות סוג (אחרי המרת אותיות סופיות): גזע + סיומת נטייה -> גזע
+_HE_STEMS = (
+    "נעל", "שעונ", "צעיפ", "תיק", "כפכפ", "סנדל", "מגפ", "כובע", "ארנק", "חגור", "חולצ",
+    "מעיל", "מכנס", "גרב", "משקפ", "ילד", "בגד",
+)
+_HE_SUFFIXES = tuple(s.translate(_FINALS) for s in ("", "י", "ים", "יים", "ות", "ה", "ת"))
+_HE_PREFIXES = ("ה", "ל", "ו", "ב", "וה", "לה", "מ")
+
+# כינויים: כל הצורות בקבוצה מנורמלות לצורה הראשונה. ביטויים של כמה מילים מוחלפים כביטוי.
+_ALIAS_GROUPS = (
+    ("נייקי", "ניקי", "נייק", "נאיקי", "נייקיי"),
+    ("אדידס", "אדידאס", "אדידאז", "אדידז"),
+    ("ג'ורדן", "גורדן", "ג'ורדאן", "ג׳ורדן", "ג'ורדנ"),
+    ("ניו בלנס", "ניו באלאנס", "ניו באלנס", "ניו בלאנס", "ניובלנס", "ניובאלאנס"),
+    ("גוצ'י", "גוצי", "גוצ׳י", "גוצ'צי", "גוצצי"),
+    ("פראדה", "פרדה", "פראדא", "פרדא"),
+    ("לואי ויטון", "לואי וויטון", "לויי ויטון", "לויי וויטון", "לוי ויטון", "לואיס ויטון", "לואי ויטאן"),
+    ("לואי", "לויי"),
+    ("אסיקס", "אסיקאס", "אסיקס'"),
+    ("יזי", "איזי", "ייזי"),
+    ("הוקה", "הוקא", "הוקה וואן וואן"),
+    ("בלנסיאגה", "בלנסיאגא", "בלנציאגה", "בלנסיאג'ה"),
+    ("שאנל", "שנל", "שאנאל"),
+    ("דיור", "דיאור"),
+    ("ז'יבנשי", "גיבנשי", "זיבנשי", "ג'יבנשי"),
+    ("סמבה", "סמבא", "סאמבה"),
+    ("גאזל", "גזל", "גאזאל"),
+    ("ספציאל", "ספזיאל", "ספשל"),
+)
+
+
+def _norm_word(word: str) -> str:
+    """אותיות קטנות, בלי ניקוד/גרשים, אותיות סופיות -> רגילות."""
+    word = _NIQQUD_RE.sub("", word.lower())
+    word = _GERESH_RE.sub("", word)
+    return word.translate(_FINALS)
+
+
+def _build_alias_map() -> tuple[list[tuple[str, str]], dict[str, str]]:
+    phrases: list[tuple[str, str]] = []
+    words: dict[str, str] = {}
+    for group in _ALIAS_GROUPS:
+        canon = " ".join(_norm_word(w) for w in group[0].split())
+        for variant in group:
+            v = " ".join(_norm_word(w) for w in variant.split())
+            if " " in v:
+                phrases.append((v, canon))
+            else:
+                words[v] = canon
+    phrases.sort(key=lambda p: -len(p[0]))  # ביטוי ארוך קודם
+    return phrases, words
+
+
+_ALIAS_PHRASES, _ALIAS_WORDS = _build_alias_map()
+
+
+def _stem_word(word: str) -> str:
+    """נעליים/נעלי/הנעליים -> נעל ; שעונים -> שעונ ; כפכפים -> כפכפ (רק למילות סוג מוכרות)."""
+    for prefix in ("",) + _HE_PREFIXES:
+        if prefix and not word.startswith(prefix):
+            continue
+        rest = word[len(prefix):]
+        for stem in _HE_STEMS:
+            if rest.startswith(stem) and rest[len(stem):] in _HE_SUFFIXES:
+                return stem
+    return word
+
+
+def _skeleton(word: str) -> str:
+    """כתיב חסר: בלי א/ו/י אחרי האות הראשונה (פראדה -> פרדה, נייקי -> נק)."""
+    if not word or not ("\u05D0" <= word[0] <= "\u05EA"):
+        return word
+    return word[0] + re.sub("[אוי]", "", word[1:])
+
+
+def normalize_search_text(text: str) -> list[str]:
+    """מחזיר רשימת מילים מנורמלות (כינויים + גזעים) לחיפוש."""
+    words = [_norm_word(w) for w in (text or "").split()]
+    s = " " + " ".join(w for w in words if w) + " "
+    s = _HE_DIGIT_BOUNDARY_RE.sub(" ", s)
+    tokens = [t for t in _TOKEN_SPLIT_RE.split(s) if t]
+    s = " " + " ".join(tokens) + " "
+    for variant, canon in _ALIAS_PHRASES:
+        s = s.replace(f" {variant} ", f" {canon} ")
+    out = []
+    for t in s.split():
+        t = _ALIAS_WORDS.get(t, t)
+        out.append(_stem_word(t))
+    return out
+
+
+# מילים שלא נושאות משמעות בחיפוש (מתעלמים מהן בשאילתה)
+_QUERY_STOPWORDS = {
+    _norm_word(w)
+    for w in (
+        "של", "את", "לי", "יש", "בבקשה", "מחפש", "מחפשת", "רוצה", "צריך", "צריכה", "עם", "גם", "the", "a", "of",
+        "היי", "הי", "שלום", "אהלן", "תודה", "מה", "קורה",
+    )
+}
+
+
+def _token_score(q: str, t: str) -> float:
+    if q == t:
+        return 100.0
+    qs, ts = _skeleton(q), _skeleton(t)
+    if len(qs) >= 2 and qs == ts:
+        return 95.0
+    if t.startswith(q) and (len(q) >= 4 or (len(q) >= 2 and q.isdigit())):
+        return 90.0  # התחלת מילה: "נייק" -> "נייקי", "1906" -> "1906r"
+    if len(q) >= 4 and len(t) >= 3:
+        score = fuzz.ratio(q, t)
+        if "\u05D0" <= q[0] <= "\u05EA" and min(len(qs), len(ts)) >= 2 and fuzz.ratio(qs, ts) < 70:
+            return 0.0  # שלד העיצורים שונה מדי ("נייקי" מול "נייבי")
+        return score
+    return 0.0
+
+
+from functools import lru_cache  # noqa: E402
+
+
+@lru_cache(maxsize=4096)
+def _title_tokens(title: str) -> tuple[str, ...]:
+    toks = normalize_search_text(title)
+    # גם צירופים של שתי מילים צמודות ("air force" -> "airforce", "ניו בלנס" -> "ניובלנס")
+    pairs = [a + b for a, b in zip(toks, toks[1:])]
+    return tuple(dict.fromkeys(toks + pairs))
+
+
+def search_score(query: str, title: str) -> float:
+    """ציון 0-100: כל מילה בשאילתה חייבת להתאים למילה כלשהי בכותרת (הציון = ההתאמה החלשה ביותר)."""
+    q_tokens = [t for t in normalize_search_text(query) if t not in _QUERY_STOPWORDS]
+    if not q_tokens:
+        return 0.0
+    t_tokens = _title_tokens(title or "")
+    if not t_tokens:
+        return 0.0
+    worst = 100.0
+    for q in q_tokens:
+        best = max(_token_score(q, t) for t in t_tokens)
+        worst = min(worst, best)
+        if worst < FUZZY_MATCH_THRESHOLD:
+            return worst
+    return worst
 
 
 def search_catalog(query: str, catalog: list[dict]) -> list[dict]:
-    """חיפוש מטושטש (fuzzy) של query מול שם המותג של כל מוצר - סובלני לטעויות
-    הקלדה קטנות. מחזיר את המוצרים התואמים, מהניקוד הגבוה לנמוך."""
-    query = (query or "").strip().lower()
+    """חיפוש טקסט סובלני מול כותרת המוצר (שדה brand): נרמול עברית (נטיות, אותיות סופיות,
+    כתיב מלא/חסר, כינויי מותגים) + התאמה מטושטשת לכל מילה. מחזיר מהציון הגבוה לנמוך."""
+    query = (query or "").strip()
     if not query:
         return []
 
-    scored: list[tuple[float, dict]] = []
+    q_lower = query.lower()
+    scored: list[tuple[float, float, dict]] = []
     for item in catalog:
-        brand = (item.get("brand") or "").strip().lower()
+        brand = (item.get("brand") or "").strip()
         if not brand:
             continue
-        score = max(fuzz.partial_ratio(query, brand), fuzz.token_sort_ratio(query, brand))
+        score = search_score(query, brand)
         if score >= FUZZY_MATCH_THRESHOLD:
-            scored.append((score, item))
+            # שובר שוויון: דמיון גולמי לכל הכותרת
+            scored.append((score, fuzz.partial_ratio(q_lower, brand.lower()), item))
 
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [item for _, item in scored]
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [item for _, _, item in scored]
+
+
+# ---------------------------------------------------------------------------
+# קטגוריה (סוג מוצר) - נגזרת ממילות מפתח בכותרת. אותם כללים כמו ב-make_package.py
+# (product_type). מוצרים ישנים בלי שדה category מקבלים אותה בזמן תצוגה.
+# ---------------------------------------------------------------------------
+
+_CATEGORY_RULES: list[tuple[str, str]] = [
+    (r"\bwatch(es)?\b|(?<![א-ת])שעונ", "שעונים"),
+    (r"\bscarf|\bscarves\b|(?<![א-ת])צעיפ", "צעיפים"),
+    (r"\bwallet|\bcard ?holder|(?<![א-ת])ארנק|\bbag\b|\bbags\b|backpack|\btote\b|\bclutch\b|(?<![א-ת])תיק", "תיקים וארנקים"),
+    (r"\bbelt\b|(?<![א-ת])חגור|sunglass|(?<![א-ת])משקפי|\bcap\b|\bhat\b|beanie|(?<![א-ת])כובע", "אביזרים"),
+    (r"hoodie|(?<![א-ת])קפוצ'?ונ|t-?shirt|\btee\b|(?<![א-ת])חולצ|\bjacket\b|\bcoat\b|(?<![א-ת])מעיל|\bpants\b|\bshorts\b"
+     r"|\bjeans\b|(?<![א-ת])מכנס|tracksuit|(?<![א-ת])אימונית|\bsocks?\b|(?<![א-ת])גרב", "ביגוד"),
+    (r"sandal|(?<![א-ת])סנדל|slide|flip-?flop|\bthong\b|slipper|mule|adilette|\bclogs?\b|(?<![א-ת])כפכפ|(?<![א-ת])מיול"
+     r"|(?<![א-ת])סלייד|(?<![א-ת])אדילט", "כפכפים וסנדלים"),
+    (r"\bboots?\b|(?<![א-ת])מגפ", "מגפיים"),
+    (r"mercurial|\bf50\b|predator|phantom|tiempo|\bcopa\b|\b(fg|ag|sg|tf)\b|football|soccer|(?<![א-ת])כדורגל", "נעלי כדורגל"),
+    (r"loafer|oxford|derby|(?<![א-ת])לואפר|(?<![א-ת])מוקסינ", "נעליים אלגנטיות"),
+]
+_KIDS_RE = re.compile(r"\bkids?\b|\bchildren\b|\btoddler\b|\b(gs|ps|td)\b|ילדים|לילדים|ילדות")
+_FOOTWEAR_CATEGORIES = {"סניקרס", "כפכפים וסנדלים", "מגפיים", "נעלי כדורגל", "נעליים אלגנטיות"}
+
+
+def derive_category(title: str) -> str:
+    text = (title or "").lower().translate(_FINALS)
+    category = "סניקרס"
+    for rx, cat in _CATEGORY_RULES:
+        if re.search(rx, text):
+            category = cat
+            break
+    if category in _FOOTWEAR_CATEGORIES and _KIDS_RE.search(text):
+        category = "ילדים"
+    return category
+
+
+def item_category(item: dict) -> str:
+    return item.get("category") or derive_category(item.get("brand") or "")
+
+
+def item_brand_name(item: dict) -> str:
+    """שם המותג מהכותרת ('Nike | Nike Dunk | ...' -> 'Nike')."""
+    title = (item.get("brand") or "").strip()
+    first = title.split("|")[0].strip() if "|" in title else (title.split()[0] if title else "")
+    return first or "—"
+
+
+def now_iso() -> str:
+    """זמן נוכחי ב-UTC בפורמט ISO (עם אזור זמן)."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def item_image_paths(item: dict) -> list[str]:
@@ -575,6 +788,8 @@ async def save_new_product(
             "image_paths": image_paths,
             "phashes": phashes,
             "video_file_ids": list(video_file_ids),
+            "category": derive_category(fields["brand"]),
+            "added_at": now_iso(),
         }
     )
     save_catalog(catalog)
@@ -802,6 +1017,10 @@ def import_zip_into_catalog(zip_path) -> dict:
             details = [str(d).strip() for d in details if str(d).strip()]
             price = str(entry.get("price") or "").strip()
 
+            category = str(entry.get("category") or "").strip() or derive_category(brand)
+            # added_at: זמן ההוספה הראשונה - נשמר גם כשמוצר קיים מתעדכן בייבוא חוזר
+            added_at = (catalog[existing_idx].get("added_at") if existing_idx is not None else None) or now_iso()
+
             item = {
                 "id": product_id,
                 "source_id": source_id,
@@ -812,7 +1031,11 @@ def import_zip_into_catalog(zip_path) -> dict:
                 "image_paths": image_paths,
                 "phashes": phashes,
                 "video_file_ids": [],
+                "category": category,
+                "added_at": added_at,
             }
+            if existing_idx is not None:
+                item["updated_at"] = now_iso()
             # ניקוי שדות ישנים אם היו
             if existing_idx is not None:
                 item.pop("image_path", None)
@@ -1148,6 +1371,90 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# /stats - סטטיסטיקות קטלוג (אדמין בלבד)
+# ---------------------------------------------------------------------------
+
+STATS_MAIN_BRANDS = ("Nike", "Adidas", "Asics", "New Balance", "Hoka", "Yeezy")
+STATS_RECENT_COUNT = 20
+
+
+def _display_tz():
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(os.environ.get("BOT_TIMEZONE", "Asia/Jerusalem"))
+    except Exception:
+        return None
+
+
+def format_added_at(value: str | None) -> str:
+    if not value:
+        return "תאריך לא ידוע"
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    tz = _display_tz()
+    if tz is not None:
+        dt = dt.astimezone(tz)
+    return dt.strftime("%d/%m/%Y %H:%M")
+
+
+def format_stats(catalog: list[dict]) -> str:
+    """בונה את הודעת /stats: סה"כ, פילוח לפי מותג ולפי סוג, ואחרונים שנוספו."""
+    total = len(catalog)
+    lines = ["📊 סטטיסטיקות קטלוג", f"סה\"כ מוצרים: {total}"]
+    if not catalog:
+        return "\n".join(lines)
+
+    brand_counts: dict[str, int] = {}
+    for item in catalog:
+        b = item_brand_name(item)
+        key = next((m for m in STATS_MAIN_BRANDS if m.lower() == b.lower()), b)
+        brand_counts[key] = brand_counts.get(key, 0) + 1
+    lines += ["", "🏷️ לפי מותג:"]
+    for b in sorted((b for b in STATS_MAIN_BRANDS if brand_counts.get(b)), key=lambda b: -brand_counts[b]):
+        lines.append(f"• {b}: {brand_counts[b]}")
+    others = sorted(((b, c) for b, c in brand_counts.items() if b not in STATS_MAIN_BRANDS), key=lambda x: (-x[1], x[0]))
+    if others:
+        lines.append(f"• מותגים אחרים: {sum(c for _, c in others)} ({', '.join(f'{b} {c}' for b, c in others)})")
+
+    cat_counts: dict[str, int] = {}
+    for item in catalog:
+        c = item_category(item)
+        cat_counts[c] = cat_counts.get(c, 0) + 1
+    lines += ["", "👟 לפי סוג:"]
+    for c, n in sorted(cat_counts.items(), key=lambda x: (-x[1], x[0])):
+        lines.append(f"• {c}: {n}")
+
+    # אחרונים שנוספו: לפי added_at (מוצרים ישנים בלי תאריך - בסוף, לפי סדר הקטלוג)
+    indexed = list(enumerate(catalog))
+    indexed.sort(key=lambda p: (p[1].get("added_at") or "", p[0]), reverse=True)
+    recent = indexed[:STATS_RECENT_COUNT]
+    lines += ["", f"🆕 {len(recent)} המוצרים האחרונים שנוספו:"]
+    for _, item in recent:
+        lines.append(f"• {format_added_at(item.get('added_at'))} | {item.get('brand') or '—'} ({item.get('id')})")
+    return "\n".join(lines)
+
+
+async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    text = format_stats(load_catalog())
+    # טלגרם מגביל אורך הודעה - נחלק לצ'אנקים לפי שורות
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 3500:
+            await update.message.reply_text(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await update.message.reply_text(chunk)
+
+
 async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
@@ -1254,6 +1561,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("catalog", handle_catalog_command))
     app.add_handler(CommandHandler("list", handle_list))
+    app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("edit", handle_edit))
     app.add_handler(CommandHandler("canceledit", handle_cancel_edit))
     app.add_handler(CommandHandler("delete", handle_delete))
